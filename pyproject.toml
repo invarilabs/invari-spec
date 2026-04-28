@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speclens"
+version = "0.1.0"
+description = "Debug prose specs by compiling them into executable workflow checks."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Speclens contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+llm = [
+  "anthropic>=0.34.0",
+  "openai>=1.40.0",
+]
+
+[project.scripts]
+speclens = "speclens.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+speclens = ["prompts/*.txt"]

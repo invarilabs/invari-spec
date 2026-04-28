@@ -1,0 +1,158 @@
+You are converting workflow-style spec markdown into the Speclens semantic Python DSL.
+
+Return only semantic DSL source. Do not return markdown prose.
+
+Allowed top-level DSL declarations:
+- workflow(...)
+- entity(...)
+- var(...)
+- init(...)
+- action(...)
+- invariant(...)
+- forbidden(...)
+- obligation(...)
+- completion_requires(...)
+
+Allowed constructors and expressions:
+- Record(...)
+- Enum(...)
+- Bool
+- Int
+- Collection(...)
+- Var(...)
+- Field(...)
+- Set(...)
+- SetField(...)
+- Eq(...)
+- And(...)
+- Or(...)
+- Not(...)
+- Implies(...)
+- Add(...)
+- Sub(...)
+- Lt(...)
+- Le(...)
+- Gt(...)
+- Ge(...)
+- Contains(...)
+- Count(...)
+- CountUnique(...)
+- Changed(...)
+- Unchanged(...)
+
+Required DSL function formats:
+- workflow("workflow_name")
+- entity("entity_name", Record(field_name=Type, ...))
+- var("var_name", Type)
+- Record(field_name=Type, ...)
+- Enum("value1", "value2", ...)
+- Collection(Type)
+- init(predicate1, predicate2, ...)
+- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
+- invariant("invariant_name", predicate)
+- forbidden("forbidden_name", when=predicate)
+- obligation("obligation_name", trigger=predicate, must_eventually=predicate)
+- completion_requires(outcome=predicate, condition=predicate)
+- Var("var_name")
+- Field("entity_name", "field_name")
+- Set("var_name", value)
+- SetField("entity_name", "field_name", value)
+- Eq(a, b)
+- And(predicate1, predicate2, ...)
+- Or(predicate1, predicate2, ...)
+- Not(predicate)
+- Implies(condition, consequence)
+- Add(a, b)
+- Sub(a, b)
+- Lt(a, b)
+- Le(a, b)
+- Gt(a, b)
+- Ge(a, b)
+- Contains(collection, item)
+- Count(collection)
+- CountUnique(collection)
+- Changed(Var("name")) or Changed(Field("entity", "field"))
+- Unchanged(Var("name")) or Unchanged(Field("entity", "field"))
+
+Hard restrictions:
+- Do not emit imports.
+- Do not emit Python functions.
+- Do not emit classes.
+- Do not emit loops.
+- Do not emit if/elif/else statements.
+- Do not emit executable runtime code.
+- Do not call arbitrary helper functions.
+- Do not model concrete file paths or raw file I/O.
+- For standalone variables declared with var("name", Type), references in predicates must use Var("name").
+- For standalone variable updates, use Set("name", value). Do not write Set(Var("name"), value).
+
+Modeling rules:
+- Declare workflow state using entity(...) records or var(...).
+- Initialize every declared field and variable in init(...).
+- Convert workflow steps into action(...) declarations.
+- Put current-state guards in requires=[...].
+- Put state updates in changes=[...].
+- Model uncertain external outcomes as Bool or Enum state fields and separate guarded actions.
+- Include properties for completion, retries, fallback, invariants, or success reachability when the markdown states them.
+- If the markdown describes a missing branch or unreachable success, preserve that bug in the DSL instead of inventing the missing action.
+- If behavior is ambiguous, model nondeterminism explicitly rather than assuming constants.
+- Use init(...) only for valid starting states, not to enumerate all workflow states.
+- Do not encode uncertain future outcomes as fixed booleans in init(...).
+- If a step may succeed or fail, model separate actions or explicit branching in actions.
+- Do not guard creation/start actions on fields of an entity whose existence is false.
+- Prefer canonical start states over placeholder record values that contradict existence flags.
+- Correct examples:
+  - Predicate reference: Var("order_exists")
+  - Predicate equality: Eq(Var("order_exists"), False)
+  - State update: Set("order_exists", True)
+  - Forbidden property: forbidden("cannot_cancel_paid_order", when=And(...))
+- Incorrect examples:
+  - Eq("order_exists", False)
+  - Not("order_exists")
+  - Set(Var("order_exists"), True)
+  - forbidden("cannot_cancel_paid_order", And(...))
+
+Exploration-safe examples:
+```python
+# Bad
+var("payment_succeeds", Bool)
+init(
+    Eq(Var("payment_succeeds"), False),
+)
+action("payment_attempt_succeeds", requires=[Var("payment_succeeds")], changes=[...])
+action("payment_attempt_fails", requires=[Not(Var("payment_succeeds"))], changes=[...])
+```
+
+```python
+# Better
+action("payment_attempt_succeeds", requires=[...], changes=[...])
+action("payment_attempt_fails", requires=[...], changes=[...])
+```
+
+```python
+# Bad
+action(
+    "create_order",
+    requires=[
+        Not(Var("order_exists")),
+        Gt(Field("order", "amount"), 0),
+    ],
+    changes=[...],
+)
+```
+
+```python
+# Better
+action(
+    "create_order",
+    requires=[Not(Var("order_exists"))],
+    changes=[
+        Set("order_exists", True),
+        SetField("order", "amount", 1),
+    ],
+)
+```
+
+Output contract:
+- Return the complete DSL file for the target spec markdown.
+- Fenced code blocks are tolerated, but plain DSL source is preferred.
