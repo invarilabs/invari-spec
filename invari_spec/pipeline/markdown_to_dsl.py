@@ -18,14 +18,14 @@ try:
 except Exception:  # noqa: BLE001
     OpenAI = None  # type: ignore[assignment]
 
-from speclens.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
-from speclens.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
-from speclens.semantic_dsl.errors import DslError
-from speclens.semantic_dsl.model import WorkflowModel
+from invari_spec.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
+from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
+from invari_spec.semantic_dsl.errors import DslError
+from invari_spec.semantic_dsl.model import WorkflowModel
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PROMPT_PATH = ROOT / "speclens" / "prompts" / "markdown_to_semantic_dsl_prompt_v1.txt"
+DEFAULT_PROMPT_PATH = ROOT / "invari_spec" / "prompts" / "markdown_to_semantic_dsl_prompt_v1.txt"
 DEFAULT_FIXTURE_ROOT = ROOT / "examples"
 DEFAULT_FIXTURE_ORDER = (
     "workflow_retry_with_fallback",
@@ -707,7 +707,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         raise ValueError("max_attempts must be at least 1")
 
     generated_root = _resolve_generated_root(req.generated_root, req.cwd)
-    run_dir = generated_root / "speclens_check" / _slugify(input_path.stem)
+    run_dir = generated_root / "invari_spec_check" / _slugify(input_path.stem)
     run_dir.mkdir(parents=True, exist_ok=True)
     _copy_input(input_path, run_dir)
 

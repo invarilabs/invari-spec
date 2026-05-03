@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from speclens.pipeline import MarkdownToTlaRequest, convert_markdown_to_tla
+from invari_spec.pipeline import MarkdownToTlaRequest, convert_markdown_to_tla
 
 
 ROOT = Path(__file__).resolve().parents[1]

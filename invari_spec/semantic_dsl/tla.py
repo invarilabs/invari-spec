@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import re
 
-from speclens.semantic_dsl.errors import DslLoweringError
-from speclens.semantic_dsl.model import (
+from invari_spec.semantic_dsl.errors import DslLoweringError
+from invari_spec.semantic_dsl.model import (
     BoolType,
     CallExpr,
     CollectionType,

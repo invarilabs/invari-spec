@@ -6,12 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from speclens.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
+from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
 from test_semantic_dsl_parser import REVIEW_WORKFLOW
 
 
 def _load_tla_sanity_module():
-    mod_path = Path(__file__).resolve().parents[1] / "speclens" / "pipeline" / "tla_sanity.py"
+    mod_path = Path(__file__).resolve().parents[1] / "invari_spec" / "pipeline" / "tla_sanity.py"
     spec = importlib.util.spec_from_file_location("semantic_dsl_tla_sanity", mod_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

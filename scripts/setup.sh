@@ -27,7 +27,7 @@ fi
 
 mkdir -p "$(dirname "$TLA_JAR_PATH")"
 
-echo "Installing Speclens into the current Python environment..."
+echo "Installing invari-spec into the current Python environment..."
 "$PYTHON_BIN" -m pip install -e "$ROOT"
 
 echo "Downloading tla2tools.jar to $TLA_JAR_PATH..."
@@ -38,4 +38,4 @@ else
 fi
 
 echo "Setup complete. Default TLC jar: $TLA_JAR_PATH"
-echo "You can now run: speclens check --file <path>"
+echo "You can now run: invari-spec check --file <path>"

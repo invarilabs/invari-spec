@@ -1,4 +1,4 @@
-You are converting workflow-style spec markdown into the Speclens semantic Python DSL.
+You are converting workflow-style spec markdown into the invari-spec semantic Python DSL.
 
 Return only semantic DSL source. Do not return markdown prose.
 

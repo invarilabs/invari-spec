@@ -1,6 +1,6 @@
 # Architecture
 
-Speclens uses a narrow pipeline:
+invari-spec uses a narrow pipeline:
 
 ```text
 spec markdown
@@ -16,6 +16,6 @@ The trusted boundary is the semantic DSL parser, not the LLM. Raw LLM output is 
 
 The repo is organized around three layers:
 
-- `speclens.semantic_dsl`: parser, typed model, and TLA+/CFG lowerer
-- `speclens.pipeline`: markdown conversion, TLC execution, and report rendering
-- `speclens.cli`: public `speclens check` entrypoint
+- `invari_spec.semantic_dsl`: parser, typed model, and TLA+/CFG lowerer
+- `invari_spec.pipeline`: markdown conversion, TLC execution, and report rendering
+- `invari_spec.cli`: public `invari-spec check` entrypoint

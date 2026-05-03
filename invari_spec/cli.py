@@ -4,11 +4,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from speclens.pipeline import MarkdownToTlaRequest, convert_markdown_to_tla, render_result
+from invari_spec.pipeline import MarkdownToTlaRequest, convert_markdown_to_tla, render_result
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="speclens", description="Debug prose specs with executable checks.")
+    parser = argparse.ArgumentParser(prog="invari-spec", description="Debug prose specs with executable checks.")
     subparsers = parser.add_subparsers(dest="command")
 
     check = subparsers.add_parser("check", help="Run the markdown -> DSL -> TLA+ pipeline on a spec markdown file.")

@@ -18,7 +18,7 @@ class CliCheckTest(unittest.TestCase):
             cmd = [
                 sys.executable,
                 "-m",
-                "speclens.cli",
+                "invari_spec.cli",
                 "check",
                 "--file",
                 str(ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md"),

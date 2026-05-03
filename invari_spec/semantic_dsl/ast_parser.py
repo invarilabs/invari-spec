@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from speclens.semantic_dsl.errors import DslParseError, DslTypeError
-from speclens.semantic_dsl.model import (
+from invari_spec.semantic_dsl.errors import DslParseError, DslTypeError
+from invari_spec.semantic_dsl.model import (
     ActionDecl,
     BoolType,
     CallExpr,

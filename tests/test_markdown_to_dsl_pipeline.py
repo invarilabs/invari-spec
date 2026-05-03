@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from speclens.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_file
-from speclens.pipeline import (
+from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_file
+from invari_spec.pipeline import (
     MarkdownToTlaRequest,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
@@ -15,7 +15,7 @@ from speclens.pipeline import (
     normalize_common_dsl_syntax,
     normalize_llm_dsl_output,
 )
-from speclens.pipeline.markdown_to_dsl import _find_tla_jar
+from invari_spec.pipeline.markdown_to_dsl import _find_tla_jar
 
 
 ROOT = Path(__file__).resolve().parents[1]

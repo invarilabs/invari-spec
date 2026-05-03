@@ -10,5 +10,5 @@ Keep changes scoped to the public spec-checking surface:
 Before opening a PR:
 
 1. Run `python3 -m unittest discover -s tests`.
-2. Run `python3 -m speclens.cli check --file examples/workflow_retry_with_fallback/SPEC.md --dsl-file examples/workflow_retry_with_fallback/expected.dsl.py --no-run-tlc`.
+2. Run `python3 -m invari_spec.cli check --file examples/workflow_retry_with_fallback/SPEC.md --dsl-file examples/workflow_retry_with_fallback/expected.dsl.py --no-run-tlc` or the installed `invari-spec check --file ...` command.
 3. Avoid introducing repo-local paths, internal ticket references, or generated artifacts.

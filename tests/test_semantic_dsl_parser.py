@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from speclens.semantic_dsl import parse_dsl_source
-from speclens.semantic_dsl.errors import DslParseError, DslTypeError
-from speclens.semantic_dsl.model import EnumType
+from invari_spec.semantic_dsl import parse_dsl_source
+from invari_spec.semantic_dsl.errors import DslParseError, DslTypeError
+from invari_spec.semantic_dsl.model import EnumType
 
 
 REVIEW_WORKFLOW = '''
