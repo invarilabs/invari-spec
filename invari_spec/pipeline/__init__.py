@@ -7,6 +7,8 @@ from invari_spec.pipeline.dsl_validation import (
     validate_dsl_source,
 )
 from invari_spec.pipeline.markdown_to_dsl import (
+    build_dsl_fidelity_review_prompt,
+    build_dsl_review_repair_prompt,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
     convert_markdown_to_tla,
@@ -20,6 +22,8 @@ __all__ = [
     "Fixture",
     "MarkdownToTlaRequest",
     "MarkdownToTlaResult",
+    "build_dsl_fidelity_review_prompt",
+    "build_dsl_review_repair_prompt",
     "build_initial_markdown_to_dsl_prompt",
     "build_minimal_dsl_repair_prompt",
     "convert_markdown_to_tla",

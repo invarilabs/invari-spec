@@ -19,6 +19,9 @@ class DslGenerationAttempt:
     candidate_path: str | None
     validation_error_path: str | None
     validation_error: str | None
+    review_feedback_path: str | None = None
+    review_repair_path: str | None = None
+    assumptions_path: str | None = None
     fix_comments: list[str] = field(default_factory=list)
 
 
