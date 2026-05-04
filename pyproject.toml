@@ -24,5 +24,8 @@ invari-spec = "invari_spec.cli:main"
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.packages.find]
+include = ["invari_spec*"]
+
 [tool.setuptools.package-data]
 invari_spec = ["prompts/*.txt"]

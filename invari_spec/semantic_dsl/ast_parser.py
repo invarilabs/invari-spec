@@ -19,6 +19,7 @@ from invari_spec.semantic_dsl.model import (
     FieldRef,
     ForbiddenDecl,
     InvariantDecl,
+    IntRangeType,
     IntType,
     LiteralExpr,
     NamedType,
@@ -287,6 +288,15 @@ class _Builder:
                 if len(node.args) != 1:
                     raise self._parse_error(node, "Collection(...) expects one item type")
                 return CollectionType(item_type=self._parse_type(node.args[0]))
+            if name == "IntRange":
+                self._no_keywords(node)
+                if len(node.args) != 2:
+                    raise self._parse_error(node, "IntRange(...) expects lo and hi integer arguments")
+                lo = self._int_arg(node.args[0], "IntRange lo")
+                hi = self._int_arg(node.args[1], "IntRange hi")
+                if lo > hi:
+                    raise self._parse_error(node, f"IntRange lo ({lo}) must be <= hi ({hi})")
+                return IntRangeType(lo=lo, hi=hi)
         raise self._parse_error(node, f"unsupported type expression: {ast.dump(node, include_attributes=False)}")
 
     def _parse_expr(self, node: ast.AST) -> Expr:
@@ -746,6 +756,11 @@ class _Builder:
             raise self._parse_error(node, f"{label} must be a string literal")
         if not node.value:
             raise self._parse_error(node, f"{label} must not be empty")
+        return node.value
+
+    def _int_arg(self, node: ast.AST, label: str) -> int:
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, int) or isinstance(node.value, bool):
+            raise self._parse_error(node, f"{label} must be an integer literal")
         return node.value
 
     def _parse_error(self, node: ast.AST, message: str) -> DslParseError:

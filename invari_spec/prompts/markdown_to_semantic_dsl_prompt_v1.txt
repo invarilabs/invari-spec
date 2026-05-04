@@ -18,6 +18,7 @@ Allowed constructors and expressions:
 - Enum(...)
 - Bool
 - Int
+- IntRange(lo, hi)
 - Collection(...)
 - AnyOf(type)
 - Var(...)
@@ -48,6 +49,7 @@ Required DSL function formats:
 - Record(field_name=Type, ...)
 - Enum("value1", "value2", ...)
 - Collection(Type)
+- IntRange(lo, hi)
 - init(predicate1, predicate2, ...)
 - action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
 - invariant("invariant_name", predicate)
@@ -58,7 +60,7 @@ Required DSL function formats:
 - Field("entity_name", "field_name")
 - Set("var_name", value)
 - SetField("entity_name", "field_name", value)
-- AnyOf(Bool), AnyOf(Int), AnyOf(Enum(...))
+- AnyOf(Bool), AnyOf(IntRange(lo, hi)), AnyOf(Enum(...))
 - Eq(a, b)
 - And(predicate1, predicate2, ...)
 - Or(predicate1, predicate2, ...)
@@ -101,6 +103,8 @@ Modeling rules:
 - Use init(...) only for valid starting states, not to enumerate all workflow states.
 - Do not encode uncertain future outcomes as fixed booleans in init(...).
 - Use AnyOf(Bool) (or AnyOf(Enum(...))) in init(...) when a field represents an uncertain external outcome; this lets TLC explore both branches instead of freezing one.
+- Never declare integer fields with bare Int when the spec implies a finite range. Use IntRange(lo, hi) instead, deriving the bounds from the spec (e.g. "up to 3 retries" → IntRange(0, 3), "between 1 and 5 items" → IntRange(1, 5)). This keeps TLC state spaces finite.
+- Use AnyOf(IntRange(lo, hi)) in init(...) when an integer field's starting value is unspecified but bounded by the spec.
 - If a step may succeed or fail, model separate actions or explicit branching in actions.
 - Do not guard creation/start actions on fields of an entity whose existence is false.
 - Prefer canonical start states over placeholder record values that contradict existence flags.
@@ -117,7 +121,7 @@ Modeling rules:
 
 Exploration-safe examples:
 ```python
-# Bad
+# Bad: freezes one branch — TLC can only explore the False path
 var("payment_succeeds", Bool)
 init(
     Eq(Var("payment_succeeds"), False),
@@ -127,9 +131,23 @@ action("payment_attempt_fails", requires=[Not(Var("payment_succeeds"))], changes
 ```
 
 ```python
-# Better
+# Better: no bool field needed — two actions are naturally non-deterministic
 action("payment_attempt_succeeds", requires=[...], changes=[...])
 action("payment_attempt_fails", requires=[...], changes=[...])
+```
+
+```python
+# Also valid: keep the bool field but initialize it non-deterministically
+entity("payment", Record(
+    status=Enum("pending", "succeeded", "failed"),
+    attempt_succeeds=Bool,
+))
+init(
+    Eq(Field("payment", "status"), "pending"),
+    Eq(Field("payment", "attempt_succeeds"), AnyOf(Bool)),  # TLC explores both TRUE and FALSE
+)
+action("payment_attempt_succeeds", requires=[Eq(Field("payment", "status"), "pending"), Field("payment", "attempt_succeeds")], changes=[...])
+action("payment_attempt_fails", requires=[Eq(Field("payment", "status"), "pending"), Not(Field("payment", "attempt_succeeds"))], changes=[...])
 ```
 
 ```python

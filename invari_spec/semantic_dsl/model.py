@@ -25,11 +25,17 @@ class CollectionType:
 
 
 @dataclass(frozen=True)
+class IntRangeType:
+    lo: int
+    hi: int
+
+
+@dataclass(frozen=True)
 class NamedType:
     name: str
 
 
-TypeRef = Union[BoolType, IntType, EnumType, CollectionType, NamedType]
+TypeRef = Union[BoolType, IntType, IntRangeType, EnumType, CollectionType, NamedType]
 
 
 @dataclass(frozen=True)
