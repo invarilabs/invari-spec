@@ -3,7 +3,10 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .venv/
+.env
 build/
 dist/
+*.egg-info/
 generated/
 third_party/tla2tools.jar
+.vscode/

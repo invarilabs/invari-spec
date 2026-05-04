@@ -4,6 +4,7 @@ import re
 
 from invari_spec.semantic_dsl.errors import DslLoweringError
 from invari_spec.semantic_dsl.model import (
+    AnyOfExpr,
     BoolType,
     CallExpr,
     CollectionType,
@@ -163,7 +164,10 @@ class _Lowerer:
             if isinstance(ref, FieldRef):
                 entity_values.setdefault(ref.entity, {})[ref.field] = value
             else:
-                scalar_clauses.append(f"{ref.name} = {self._expr(value)}")
+                if isinstance(value, AnyOfExpr):
+                    scalar_clauses.append(f"{ref.name} \\in {self._type_expr(value.type_ref, ref.name, None)}")
+                else:
+                    scalar_clauses.append(f"{ref.name} = {self._expr(value)}")
 
         clauses: list[str] = []
         for entity_name, entity in self.model.entities.items():
@@ -174,10 +178,22 @@ class _Lowerer:
                     raise DslLoweringError(
                         f"cannot lower partial init for entity {entity_name}: missing {', '.join(missing)}"
                     )
-                record_fields = ", ".join(f"{field} |-> {self._expr(fields[field])}" for field in entity.fields)
-                clauses.append(f"{entity_name} = [{record_fields}]")
+                if any(isinstance(v, AnyOfExpr) for v in fields.values()):
+                    field_sets = ", ".join(
+                        f"{field}: {self._init_value_as_set(fields[field], entity_name, field)}"
+                        for field in entity.fields
+                    )
+                    clauses.append(f"{entity_name} \\in [{field_sets}]")
+                else:
+                    record_fields = ", ".join(f"{field} |-> {self._expr(fields[field])}" for field in entity.fields)
+                    clauses.append(f"{entity_name} = [{record_fields}]")
         clauses.extend(scalar_clauses)
         return clauses
+
+    def _init_value_as_set(self, value: Expr, entity_name: str, field_name: str) -> str:
+        if isinstance(value, AnyOfExpr):
+            return self._type_expr(value.type_ref, entity_name, field_name)
+        return f"{{{self._expr(value)}}}"
 
     def _init_field_assignment(self, expr: Expr) -> tuple[Ref, Expr] | None:
         if not isinstance(expr, CallExpr) or expr.op != "Eq" or len(expr.args) != 2:
@@ -284,6 +300,8 @@ class _Lowerer:
             return self._ref(expr.ref, primed=False)
         if isinstance(expr, CallExpr):
             return self._call_expr(expr)
+        if isinstance(expr, AnyOfExpr):
+            raise DslLoweringError("AnyOf(...) is only valid as the value in init Eq(...) assignments")
         raise DslLoweringError(f"unsupported expression: {expr!r}")
 
     def _call_expr(self, expr: CallExpr) -> str:

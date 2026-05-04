@@ -19,6 +19,7 @@ Allowed constructors and expressions:
 - Bool
 - Int
 - Collection(...)
+- AnyOf(type)
 - Var(...)
 - Field(...)
 - Set(...)
@@ -57,6 +58,7 @@ Required DSL function formats:
 - Field("entity_name", "field_name")
 - Set("var_name", value)
 - SetField("entity_name", "field_name", value)
+- AnyOf(Bool), AnyOf(Int), AnyOf(Enum(...))
 - Eq(a, b)
 - And(predicate1, predicate2, ...)
 - Or(predicate1, predicate2, ...)
@@ -98,6 +100,7 @@ Modeling rules:
 - If behavior is ambiguous, model nondeterminism explicitly rather than assuming constants.
 - Use init(...) only for valid starting states, not to enumerate all workflow states.
 - Do not encode uncertain future outcomes as fixed booleans in init(...).
+- Use AnyOf(Bool) (or AnyOf(Enum(...))) in init(...) when a field represents an uncertain external outcome; this lets TLC explore both branches instead of freezing one.
 - If a step may succeed or fail, model separate actions or explicit branching in actions.
 - Do not guard creation/start actions on fields of an entity whose existence is false.
 - Prefer canonical start states over placeholder record values that contradict existence flags.

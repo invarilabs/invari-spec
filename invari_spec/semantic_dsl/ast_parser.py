@@ -8,6 +8,7 @@ from typing import Any
 from invari_spec.semantic_dsl.errors import DslParseError, DslTypeError
 from invari_spec.semantic_dsl.model import (
     ActionDecl,
+    AnyOfExpr,
     BoolType,
     CallExpr,
     CollectionType,
@@ -315,6 +316,11 @@ class _Builder:
                     field=self._string_arg(node.args[1], "field name"),
                 )
             )
+        if name == "AnyOf":
+            self._no_keywords(node)
+            if len(node.args) != 1:
+                raise self._parse_error(node, "AnyOf(...) expects one type argument")
+            return AnyOfExpr(self._parse_type(node.args[0]))
         if name not in _EXPR_OPS:
             raise self._parse_error(node, f"unsupported DSL expression call: {name}")
         self._no_keywords(node)
@@ -505,6 +511,8 @@ class _Builder:
         for ref_key in sorted(read_refs):
             if ref_key not in init_assigned or ref_key in changed:
                 continue
+            if isinstance(init_assigned[ref_key], AnyOfExpr):
+                continue
             if not self._looks_like_branch_selector(ref_key):
                 continue
             self.warnings.append(
@@ -556,6 +564,8 @@ class _Builder:
         changed = self._collect_changed_refs()
         for ref_key, value in sorted(init_assigned.items()):
             if ref_key in changed or not self._looks_like_branch_selector(ref_key):
+                continue
+            if isinstance(value, AnyOfExpr):
                 continue
             branches = []
             for action in self.actions:

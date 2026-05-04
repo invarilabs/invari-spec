@@ -147,7 +147,7 @@ class DefaultSpecDebuggingLLMClient:
             )
             return resp.choices[0].message.content or ""
         if provider == "claude" and self.claude_client:
-            model_name = model or "claude-3-haiku-20240307"
+            model_name = model or "claude-haiku-4-5-20251001"
             resp = self.claude_client.messages.create(
                 model=model_name,
                 max_tokens=min(max_tokens, 4096),

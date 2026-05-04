@@ -4,6 +4,11 @@ import argparse
 import sys
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 from invari_spec.pipeline import MarkdownToTlaRequest, convert_markdown_to_tla, render_result
 
 
@@ -28,6 +33,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if load_dotenv:
+        load_dotenv()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command != "check":

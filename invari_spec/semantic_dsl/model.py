@@ -74,7 +74,12 @@ class CallExpr:
     args: tuple["Expr", ...]
 
 
-Expr = Union[LiteralExpr, RefExpr, CallExpr]
+@dataclass(frozen=True)
+class AnyOfExpr:
+    type_ref: TypeRef
+
+
+Expr = Union[LiteralExpr, RefExpr, CallExpr, AnyOfExpr]
 
 
 @dataclass(frozen=True)
