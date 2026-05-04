@@ -19,6 +19,7 @@ Allowed constructors and expressions:
 - Bool
 - Int
 - IntRange(lo, hi)
+- IntSet(v1, v2, ...)
 - Collection(...)
 - AnyOf(type)
 - Var(...)
@@ -60,7 +61,7 @@ Required DSL function formats:
 - Field("entity_name", "field_name")
 - Set("var_name", value)
 - SetField("entity_name", "field_name", value)
-- AnyOf(Bool), AnyOf(IntRange(lo, hi)), AnyOf(Enum(...))
+- AnyOf(Bool), AnyOf(IntRange(lo, hi)), AnyOf(IntSet(v1, v2, ...)), AnyOf(Enum(...))
 - Eq(a, b)
 - And(predicate1, predicate2, ...)
 - Or(predicate1, predicate2, ...)
@@ -103,8 +104,14 @@ Modeling rules:
 - Use init(...) only for valid starting states, not to enumerate all workflow states.
 - Do not encode uncertain future outcomes as fixed booleans in init(...).
 - Use AnyOf(Bool) (or AnyOf(Enum(...))) in init(...) when a field represents an uncertain external outcome; this lets TLC explore both branches instead of freezing one.
+- Any Bool field that appears in an action's requires guard MUST be initialized with AnyOf(Bool) in init, unless it exclusively represents a process-tracking flag that is always False at workflow start (e.g. a "completed" or "submitted" flag that only becomes True through an action). Properties of the input (e.g. is_alcohol, has_itemization, exceeds_limit, user_approved) are uncertain and must use AnyOf(Bool).
 - Never declare integer fields with bare Int when the spec implies a finite range. Use IntRange(lo, hi) instead, deriving the bounds from the spec (e.g. "up to 3 retries" → IntRange(0, 3), "between 1 and 5 items" → IntRange(1, 5)). This keeps TLC state spaces finite.
-- Use AnyOf(IntRange(lo, hi)) in init(...) when an integer field's starting value is unspecified but bounded by the spec.
+- Prefer AnyOf(IntSet(...)) over AnyOf(IntRange(...)) for fields with policy thresholds. Pick one representative value below, at, and just above each threshold. For example, if the spec checks amount > 50 and amount > 2500, use AnyOf(IntSet(0, 49, 50, 51, 2499, 2500, 2501)) instead of AnyOf(IntRange(0, 2500)). This avoids enumerating thousands of states.
+- Use AnyOf(IntRange(lo, hi)) only when the field has no thresholds and needs exhaustive range coverage (e.g. a small retry counter).
+- Do NOT create a Bool field that is logically derived from another field already in the model. Use the predicate directly in action guards instead. For example, if amount=IntSet(...) is already declared, do not add exceeds_limit=Bool — instead use Gt(Field("expense", "amount"), 2500) directly in requires=[...]. Redundant derived flags create contradictory init states when both are AnyOf.
+- CRITICAL: AnyOf(...) is ONLY valid inside init(...) as the value of an Eq(...) assignment. It is NOT a type and must never appear inside entity(...) or var(...). The field type and the init value are separate: entity declares the type (IntSet, IntRange, Bool, Enum), init uses AnyOf to make that value non-deterministic.
+  - Correct: entity("e", Record(amount=IntSet(0, 50, 51))) and init(Eq(Field("e", "amount"), AnyOf(IntSet(0, 50, 51))))
+  - Wrong: entity("e", Record(amount=AnyOf(IntSet(0, 50, 51))))
 - If a step may succeed or fail, model separate actions or explicit branching in actions.
 - Do not guard creation/start actions on fields of an entity whose existence is false.
 - Prefer canonical start states over placeholder record values that contradict existence flags.
@@ -148,6 +155,30 @@ init(
 )
 action("payment_attempt_succeeds", requires=[Eq(Field("payment", "status"), "pending"), Field("payment", "attempt_succeeds")], changes=[...])
 action("payment_attempt_fails", requires=[Eq(Field("payment", "status"), "pending"), Not(Field("payment", "attempt_succeeds"))], changes=[...])
+```
+
+```python
+# Bad: amount pinned to 0 — TLC never explores branches that depend on amount thresholds
+entity("expense", Record(
+    status=Enum("draft", "submitted"),
+    amount=IntRange(0, 2500),
+))
+init(
+    Eq(Field("expense", "status"), "draft"),
+    Eq(Field("expense", "amount"), 0),  # frozen: policy checks on amount > 50 or > 2500 are never reachable
+)
+```
+
+```python
+# Better: amount is non-deterministic — TLC explores all values in range including threshold-crossing ones
+entity("expense", Record(
+    status=Enum("draft", "submitted"),
+    amount=IntRange(0, 2500),
+))
+init(
+    Eq(Field("expense", "status"), "draft"),
+    Eq(Field("expense", "amount"), AnyOf(IntRange(0, 2500))),  # TLC explores 0, 1, ..., 2500
+)
 ```
 
 ```python

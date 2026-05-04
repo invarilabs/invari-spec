@@ -20,6 +20,7 @@ from invari_spec.semantic_dsl.model import (
     ForbiddenDecl,
     InvariantDecl,
     IntRangeType,
+    IntSetType,
     IntType,
     LiteralExpr,
     NamedType,
@@ -297,6 +298,14 @@ class _Builder:
                 if lo > hi:
                     raise self._parse_error(node, f"IntRange lo ({lo}) must be <= hi ({hi})")
                 return IntRangeType(lo=lo, hi=hi)
+            if name == "IntSet":
+                self._no_keywords(node)
+                if not node.args:
+                    raise self._parse_error(node, "IntSet(...) expects at least one integer value")
+                values = tuple(self._int_arg(arg, "IntSet value") for arg in node.args)
+                if len(set(values)) != len(values):
+                    raise self._parse_error(node, "IntSet(...) contains duplicate values")
+                return IntSetType(values=values)
         raise self._parse_error(node, f"unsupported type expression: {ast.dump(node, include_attributes=False)}")
 
     def _parse_expr(self, node: ast.AST) -> Expr:

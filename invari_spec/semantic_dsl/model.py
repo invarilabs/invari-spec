@@ -31,11 +31,16 @@ class IntRangeType:
 
 
 @dataclass(frozen=True)
+class IntSetType:
+    values: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class NamedType:
     name: str
 
 
-TypeRef = Union[BoolType, IntType, IntRangeType, EnumType, CollectionType, NamedType]
+TypeRef = Union[BoolType, IntType, IntRangeType, IntSetType, EnumType, CollectionType, NamedType]
 
 
 @dataclass(frozen=True)

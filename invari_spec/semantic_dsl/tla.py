@@ -15,6 +15,7 @@ from invari_spec.semantic_dsl.model import (
     FieldRef,
     ForbiddenDecl,
     IntRangeType,
+    IntSetType,
     IntType,
     LiteralExpr,
     NamedType,
@@ -140,6 +141,8 @@ class _Lowerer:
             return "Int"
         if isinstance(type_ref, IntRangeType):
             return f"{type_ref.lo}..{type_ref.hi}"
+        if isinstance(type_ref, IntSetType):
+            return "{" + ", ".join(str(v) for v in type_ref.values) + "}"
         if isinstance(type_ref, EnumType):
             prefix = f"{owner}_{field}" if field else owner
             return _operator_name(prefix + "_Domain")

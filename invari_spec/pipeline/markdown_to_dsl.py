@@ -362,7 +362,7 @@ def normalize_common_dsl_syntax(source: str) -> str:
     source = re.sub(r'Set\(\s*Var\(\s*"([^"]+)"\s*\)\s*,', r'Set("\1",', source)
     source = re.sub(r'Eq\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,', r'Eq(Var("\1"),', source)
     source = re.sub(r'Not\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)', r'Not(Var("\1"))', source)
-    source = re.sub(r'forbidden\(\s*("[^"]+")\s*,\s*(?!when\s*=)', r'forbidden(\1, when=', source)
+    source = re.sub(r'forbidden\(\s*("[^"]+")\s*,\s*(?!\s*when\s*=)', r'forbidden(\1, when=', source)
     return source
 
 
