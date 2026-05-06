@@ -204,6 +204,9 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("First, apply the numbered review changes as-is", prompt)
         self.assertIn("Next, answer every question", prompt)
         self.assertIn("Return exactly two fenced blocks", prompt)
+        self.assertIn("Begin your response with the ```python fenced block", prompt)
+        self.assertIn("Do not include any prose before the first fence", prompt)
+        self.assertIn("still return the previous DSL unchanged", prompt)
         self.assertIn("```python", prompt)
         self.assertIn("```text", prompt)
         self.assertIn("Formal modeling review feedback:", prompt)
@@ -401,6 +404,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 Path(result.attempts[0].review_repair_path or "").read_text(encoding="utf-8"),
                 repaired.lstrip("\n"),
             )
+            self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.repair_response.txt").exists())
             self.assertEqual(
                 Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8").strip(),
                 "attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",

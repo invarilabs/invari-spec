@@ -323,7 +323,10 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
                 "If a question cannot be deduced, choose the smallest assumption that preserves spec intent.",
                 "Apply any DSL changes implied by those answers as well.",
                 "Return exactly two fenced blocks and nothing else.",
+                "Begin your response with the ```python fenced block.",
+                "Do not include any prose before the first fence.",
                 "The first fenced block must be ```python and contain only the full corrected DSL file.",
+                "If you cannot improve the DSL, still return the previous DSL unchanged inside the ```python block.",
                 "The second fenced block must be ```text and contain only answered questions in this exact format:",
                 "question#1: ...",
                 "answer#1: ...",
@@ -565,6 +568,14 @@ def write_review_repair_artifact(*, run_dir: Path, attempt_no: int, candidate_so
     repair_path = attempts_dir / f"attempt_{attempt_no}.dsl.py"
     repair_path.write_text(candidate_source, encoding="utf-8")
     return repair_path
+
+
+def write_review_repair_response_artifact(*, run_dir: Path, attempt_no: int, raw_response: str) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    response_path = attempts_dir / f"attempt_{attempt_no}.repair_response.txt"
+    response_path.write_text(raw_response, encoding="utf-8")
+    return response_path
 
 
 def append_review_assumptions_artifact(*, run_dir: Path, attempt_no: int, qa_pairs: list[tuple[str, str]]) -> Path:
@@ -1037,6 +1048,11 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback=review_feedback,
                 )
                 raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
+                write_review_repair_response_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    raw_response=raw_repair_response,
+                )
                 try:
                     candidate_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
                 except Exception as exc:  # noqa: BLE001
