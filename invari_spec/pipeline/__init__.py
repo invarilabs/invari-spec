@@ -15,13 +15,20 @@ from invari_spec.pipeline.markdown_to_dsl import (
     load_fixtures,
     render_result,
 )
-from invari_spec.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
+from invari_spec.pipeline.result_types import (
+    DslGenerationAttempt,
+    Fixture,
+    MarkdownToTlaRequest,
+    MarkdownToTlaResult,
+    PipelineTiming,
+)
 
 __all__ = [
     "DslGenerationAttempt",
     "Fixture",
     "MarkdownToTlaRequest",
     "MarkdownToTlaResult",
+    "PipelineTiming",
     "build_dsl_fidelity_review_prompt",
     "build_dsl_review_repair_prompt",
     "build_initial_markdown_to_dsl_prompt",

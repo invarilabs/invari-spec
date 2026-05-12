@@ -6,7 +6,9 @@ import re
 import shutil
 import subprocess
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from time import perf_counter
 from typing import Literal, Protocol
 
 try:
@@ -19,7 +21,13 @@ try:
 except Exception:  # noqa: BLE001
     OpenAI = None  # type: ignore[assignment]
 
-from invari_spec.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
+from invari_spec.pipeline.result_types import (
+    DslGenerationAttempt,
+    Fixture,
+    MarkdownToTlaRequest,
+    MarkdownToTlaResult,
+    PipelineTiming,
+)
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
 from invari_spec.semantic_dsl.errors import DslError
 from invari_spec.semantic_dsl.model import WorkflowModel
@@ -73,6 +81,23 @@ Canonical update forms:
 - Set("var_name", value)
 - SetField("entity", "field", value)
 """.strip()
+
+
+@contextmanager
+def _timed_stage(timings: list[PipelineTiming] | None, stage: str, detail: str | None = None):
+    if timings is None:
+        yield
+        return
+    started_at = perf_counter()
+    try:
+        yield
+    finally:
+        timings.append(PipelineTiming(stage=stage, seconds=perf_counter() - started_at, detail=detail))
+
+
+def _add_total_timing(timings: list[PipelineTiming], started_at: float) -> list[PipelineTiming]:
+    without_total = [timing for timing in timings if timing.stage != "total"]
+    return without_total + [PipelineTiming(stage="total", seconds=perf_counter() - started_at)]
 
 
 def _build_validation_repair_hints(validation_error: str) -> list[str]:
@@ -659,6 +684,7 @@ def _build_result(
     tlc_exit_code: int | None,
     trace: str,
     has_liveness: bool,
+    timings: list[PipelineTiming] | None,
     extra_notes: list[str] | None = None,
 ) -> MarkdownToTlaResult:
     underspecified = _underspecified_assumptions(warnings)
@@ -699,6 +725,7 @@ def _build_result(
         notes=notes,
         tlc_exit_code=tlc_exit_code,
         trace=trace,
+        timings=list(timings or []),
     )
 
 
@@ -724,8 +751,13 @@ def _error_result(
     trace: str = "",
     warnings: list[str] | None = None,
     has_liveness: bool = False,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
 ) -> MarkdownToTlaResult:
     _ = req
+    recorded_timings = list(timings) if timings is not None else None
+    if pipeline_started_at is not None and recorded_timings is not None:
+        recorded_timings = _add_total_timing(recorded_timings, pipeline_started_at)
     fix_comments: list[str] = []
     for attempt in attempts:
         fix_comments.extend(attempt.fix_comments)
@@ -746,6 +778,7 @@ def _error_result(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        timings=recorded_timings,
         extra_notes=None,
     )
     _write_result(result)
@@ -761,13 +794,18 @@ def _finalize_validated_model(
     model: WorkflowModel,
     final_candidate_path: Path,
     llm_client: LLMClient | None = None,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
 ) -> MarkdownToTlaResult:
+    recorded_timings = list(timings) if timings is not None else None
     final_dsl_path = run_dir / "final.dsl.py"
-    shutil.copyfile(final_candidate_path, final_dsl_path)
+    with _timed_stage(recorded_timings, "file_io", "write final DSL"):
+        shutil.copyfile(final_candidate_path, final_dsl_path)
     has_liveness = bool(model.obligations)
 
     try:
-        tla_path, cfg_path = write_tla_artifacts(model, run_dir)
+        with _timed_stage(recorded_timings, "tla_lowering"):
+            tla_path, cfg_path = write_tla_artifacts(model, run_dir)
     except Exception as exc:  # noqa: BLE001
         return _error_result(
             req=req,
@@ -779,6 +817,8 @@ def _finalize_validated_model(
             validation_error=str(exc),
             dsl_path=final_dsl_path,
             has_liveness=has_liveness,
+            timings=recorded_timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
     tlc_output_path = None
@@ -799,19 +839,22 @@ def _finalize_validated_model(
             def _run_assumption_summary() -> None:
                 nonlocal assumptions_summary_path, assumptions_summary_error
                 try:
-                    assumptions_text = assumptions_path.read_text(encoding="utf-8")
+                    with _timed_stage(recorded_timings, "file_io", "read assumptions"):
+                        assumptions_text = assumptions_path.read_text(encoding="utf-8")
                     summary_client = llm_client or DefaultSpecDebuggingLLMClient()
-                    summary_text = (summary_client.generate(
-                        build_assumptions_summary_prompt(assumptions_text=assumptions_text),
-                        model=req.llm_model,
-                        max_tokens=2048,
-                    )).strip()
+                    with _timed_stage(recorded_timings, "assumptions_summary"):
+                        summary_text = (summary_client.generate(
+                            build_assumptions_summary_prompt(assumptions_text=assumptions_text),
+                            model=req.llm_model,
+                            max_tokens=2048,
+                        )).strip()
                     if not summary_text:
                         raise ValueError("LLM returned empty assumptions summary")
-                    assumptions_summary_path = write_assumptions_summary_artifact(
-                        run_dir=run_dir,
-                        summary_text=summary_text,
-                    )
+                    with _timed_stage(recorded_timings, "file_io", "write assumptions summary"):
+                        assumptions_summary_path = write_assumptions_summary_artifact(
+                            run_dir=run_dir,
+                            summary_text=summary_text,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     assumptions_summary_error = str(exc)
 
@@ -819,8 +862,10 @@ def _finalize_validated_model(
             summary_thread.start()
         tlc_output_path = run_dir / "tlc.out"
         try:
-            tlc_status, tlc_exit_code, tlc_raw, trace = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
-            tlc_output_path.write_text(tlc_raw, encoding="utf-8")
+            with _timed_stage(recorded_timings, "tlc"):
+                tlc_status, tlc_exit_code, tlc_raw, trace = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
+            with _timed_stage(recorded_timings, "file_io", "write TLC output"):
+                tlc_output_path.write_text(tlc_raw, encoding="utf-8")
             status = tlc_status
             summary = "TLC passed" if tlc_status == "pass" else "TLC reported a failure"
         except Exception as exc:  # noqa: BLE001
@@ -845,6 +890,8 @@ def _finalize_validated_model(
                 tlc_output_path=tlc_output_path,
                 warnings=warnings,
                 has_liveness=has_liveness,
+                timings=recorded_timings,
+                pipeline_started_at=pipeline_started_at,
             )
         if summary_thread is not None:
             summary_thread.join()
@@ -856,6 +903,8 @@ def _finalize_validated_model(
     all_fix_comments: list[str] = []
     for attempt in attempts:
         all_fix_comments.extend(attempt.fix_comments)
+    if pipeline_started_at is not None and recorded_timings is not None:
+        recorded_timings = _add_total_timing(recorded_timings, pipeline_started_at)
     result = _build_result(
         status=status,
         input_path=input_path,
@@ -873,6 +922,7 @@ def _finalize_validated_model(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        timings=recorded_timings,
         extra_notes=extra_notes,
     )
     _write_result(result)
@@ -886,27 +936,34 @@ def _convert_existing_dsl(
     run_dir: Path,
     dsl_file: Path,
     llm_client: LLMClient | None = None,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
 ) -> MarkdownToTlaResult:
+    recorded_timings = list(timings) if timings is not None else None
     if not dsl_file.exists() or not dsl_file.is_file():
         raise FileNotFoundError(f"DSL file not found: {dsl_file}")
 
-    candidate_source = normalize_common_dsl_syntax(dsl_file.read_text(encoding="utf-8"))
-    initial_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
-    candidate_path, validation_path = write_validation_attempt_artifacts(
-        run_dir=run_dir,
-        attempt_no=1,
-        candidate_source=candidate_source,
-        validation_error=None,
-    )
+    with _timed_stage(recorded_timings, "file_io", "read DSL file"):
+        candidate_source = normalize_common_dsl_syntax(dsl_file.read_text(encoding="utf-8"))
+    with _timed_stage(recorded_timings, "file_io", "write initial/validation DSL artifacts"):
+        initial_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
+        candidate_path, validation_path = write_validation_attempt_artifacts(
+            run_dir=run_dir,
+            attempt_no=1,
+            candidate_source=candidate_source,
+            validation_error=None,
+        )
     fix_comments = extract_fix_comments(candidate_source)
     attempts: list[DslGenerationAttempt] = []
 
     try:
-        model = validate_dsl_source(candidate_source, str(candidate_path))
+        with _timed_stage(recorded_timings, "dsl_validation", "existing DSL"):
+            model = validate_dsl_source(candidate_source, str(candidate_path))
     except DslError as exc:
         validation_error = str(exc)
         validation_path = run_dir / "dsl_validation_attempts" / "attempt_1.validation.txt"
-        validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+        with _timed_stage(recorded_timings, "file_io", "write validation error"):
+            validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
         attempts.append(
             DslGenerationAttempt(
                 attempt=1,
@@ -926,6 +983,8 @@ def _convert_existing_dsl(
             summary="Existing DSL file failed validation",
             validation_error=validation_error,
             dsl_path=initial_path,
+            timings=recorded_timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
     attempts.append(
@@ -946,10 +1005,14 @@ def _convert_existing_dsl(
         model=model,
         final_candidate_path=candidate_path,
         llm_client=llm_client,
+        timings=recorded_timings,
+        pipeline_started_at=pipeline_started_at,
     )
 
 
 def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient | None = None) -> MarkdownToTlaResult:
+    pipeline_started_at = perf_counter() if req.collect_timings else None
+    timings: list[PipelineTiming] | None = [] if req.collect_timings else None
     input_path = req.input_path.expanduser().resolve()
     if not input_path.exists() or not input_path.is_file():
         raise FileNotFoundError(f"spec markdown not found: {input_path}")
@@ -958,8 +1021,9 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
 
     generated_root = _resolve_generated_root(req.generated_root, req.cwd)
     run_dir = generated_root / "invari_spec_check" / _slugify(input_path.stem)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _copy_input(input_path, run_dir)
+    with _timed_stage(timings, "file_io", "prepare run directory and copy input"):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _copy_input(input_path, run_dir)
 
     if req.dsl_file is not None:
         return _convert_existing_dsl(
@@ -968,10 +1032,14 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             run_dir=run_dir,
             dsl_file=req.dsl_file.expanduser().resolve(),
             llm_client=llm_client,
+            timings=timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
-    markdown = input_path.read_text(encoding="utf-8")
-    fixtures = load_fixtures()
+    with _timed_stage(timings, "file_io", "read markdown"):
+        markdown = input_path.read_text(encoding="utf-8")
+    with _timed_stage(timings, "file_io", "load fixtures"):
+        fixtures = load_fixtures()
     client = llm_client or DefaultSpecDebuggingLLMClient()
 
     attempts: list[DslGenerationAttempt] = []
@@ -1004,16 +1072,19 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             )
 
         try:
-            candidate_source = normalize_llm_dsl_output(client.generate(prompt, model=req.llm_model, max_tokens=16384))
+            stage = "dsl_generation" if attempt_no == 1 else "repair_loop"
+            with _timed_stage(timings, stage, f"attempt {attempt_no}"):
+                candidate_source = normalize_llm_dsl_output(client.generate(prompt, model=req.llm_model, max_tokens=16384))
         except Exception as exc:  # noqa: BLE001
             candidate_source = ""
             validation_error = str(exc)
-            candidate_path, validation_path = write_validation_attempt_artifacts(
-                run_dir=run_dir,
-                attempt_no=attempt_no,
-                candidate_source=candidate_source,
-                validation_error=validation_error,
-            )
+            with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source=candidate_source,
+                    validation_error=validation_error,
+                )
             attempts.append(
                 DslGenerationAttempt(
                     attempt=attempt_no,
@@ -1031,15 +1102,18 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             continue
 
         if attempt_no == 1:
-            initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
+            with _timed_stage(timings, "file_io", "write initial DSL"):
+                initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
             for review_attempt_no in range(1, MAX_REVIEW_ATTEMPTS + 1):
                 review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
-                review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
-                review_feedback_path = write_review_feedback_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    review_feedback=review_feedback or "No review feedback returned.",
-                )
+                with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
+                    review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
+                with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
+                    review_feedback_path = write_review_feedback_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        review_feedback=review_feedback or "No review feedback returned.",
+                    )
                 if not review_feedback or _review_says_no_gaps(review_feedback):
                     break
                 review_repair_prompt = build_dsl_review_repair_prompt(
@@ -1047,12 +1121,14 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     previous_output=candidate_source,
                     review_feedback=review_feedback,
                 )
-                raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
-                write_review_repair_response_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    raw_response=raw_repair_response,
-                )
+                with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
+                    raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
+                with _timed_stage(timings, "file_io", f"write review repair response {review_attempt_no}"):
+                    write_review_repair_response_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        raw_response=raw_repair_response,
+                    )
                 try:
                     candidate_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
                 except Exception as exc:  # noqa: BLE001
@@ -1085,6 +1161,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                         summary=f"Review repair failed: {exc}",
                         validation_error=validation_error,
                         dsl_path=initial_dsl_path,
+                        timings=timings,
+                        pipeline_started_at=pipeline_started_at,
                     )
                 if _review_has_questions(review_feedback) and not qa_pairs:
                     validation_error = "review repair response missing question/answer pairs for review questions"
@@ -1116,36 +1194,43 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                         summary="Review repair failed: missing question answers",
                         validation_error=validation_error,
                         dsl_path=initial_dsl_path,
+                        timings=timings,
+                        pipeline_started_at=pipeline_started_at,
                     )
-                review_repair_path = write_review_repair_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    candidate_source=candidate_source,
-                )
-                if qa_pairs:
-                    assumptions_path = append_review_assumptions_artifact(
+                with _timed_stage(timings, "file_io", f"write review repair DSL {review_attempt_no}"):
+                    review_repair_path = write_review_repair_artifact(
                         run_dir=run_dir,
                         attempt_no=review_attempt_no,
-                        qa_pairs=qa_pairs,
+                        candidate_source=candidate_source,
                     )
+                if qa_pairs:
+                    with _timed_stage(timings, "file_io", f"write review assumptions {review_attempt_no}"):
+                        assumptions_path = append_review_assumptions_artifact(
+                            run_dir=run_dir,
+                            attempt_no=review_attempt_no,
+                            qa_pairs=qa_pairs,
+                        )
                 previous_output = candidate_source
 
-        candidate_path, _ = write_validation_attempt_artifacts(
-            run_dir=run_dir,
-            attempt_no=attempt_no,
-            candidate_source=candidate_source,
-            validation_error=None,
-        )
+        with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+            candidate_path, _ = write_validation_attempt_artifacts(
+                run_dir=run_dir,
+                attempt_no=attempt_no,
+                candidate_source=candidate_source,
+                validation_error=None,
+            )
         fix_comments = extract_fix_comments(candidate_source)
 
         try:
             if attempt_no > 1 and not _has_attempt_fix_comment(candidate_source, attempt_no):
                 raise ValueError(f"repair attempt {attempt_no} missing # FIX attempt {attempt_no}: comment")
-            model = validate_dsl_source(candidate_source, str(candidate_path))
+            with _timed_stage(timings, "dsl_validation", f"attempt {attempt_no}"):
+                model = validate_dsl_source(candidate_source, str(candidate_path))
         except (DslError, ValueError) as exc:
             validation_error = str(exc)
             validation_path = run_dir / "dsl_validation_attempts" / f"attempt_{attempt_no}.validation.txt"
-            validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+            with _timed_stage(timings, "file_io", f"write validation error {attempt_no}"):
+                validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
             attempts.append(
                 DslGenerationAttempt(
                     attempt=attempt_no,
@@ -1192,6 +1277,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             validation_error=validation_error or None,
             dsl_path=initial_dsl_path,
             warnings=warning_hints,
+            timings=timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
     return _finalize_validated_model(
@@ -1202,6 +1289,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         model=model,
         final_candidate_path=final_candidate_path,
         llm_client=client,
+        timings=timings,
+        pipeline_started_at=pipeline_started_at,
     )
 
 

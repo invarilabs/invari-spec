@@ -26,6 +26,13 @@ class DslGenerationAttempt:
 
 
 @dataclass(frozen=True)
+class PipelineTiming:
+    stage: str
+    seconds: float
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class MarkdownToTlaRequest:
     input_path: Path
     generated_root: Path
@@ -36,6 +43,7 @@ class MarkdownToTlaRequest:
     max_attempts: int = 3
     run_tlc: bool = True
     cwd: Path = Path.cwd()
+    collect_timings: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,10 @@ class MarkdownToTlaResult:
     notes: list[str]
     tlc_exit_code: int | None = None
     trace: str = ""
+    timings: list[PipelineTiming] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        if not self.timings:
+            payload.pop("timings", None)
+        return payload
