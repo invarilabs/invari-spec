@@ -27,6 +27,34 @@ from invari_spec.pipeline import (
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_DSL = (ROOT / "examples" / "workflow_retry_with_fallback" / "expected.dsl.py").read_text(encoding="utf-8")
+INVALID_DSL = '''
+workflow("invalid_initial")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+    retry_count=Int,
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    requires=[
+        Eq(Field("task", "status"), "ready"),
+    ],
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+)
+'''
+
+REPAIRED_DSL = INVALID_DSL.replace(
+    "init(\n",
+    'init(\n    # FIX attempt 2: initialize missing field task.retry_count\n    Eq(Field("task", "retry_count"), 0),\n',
+    1,
+)
 
 
 class BenchmarkUtilsTest(unittest.TestCase):
@@ -96,6 +124,40 @@ class BenchmarkUtilsTest(unittest.TestCase):
             timing_only_summary = summarize_benchmark_result(result)
             self.assertEqual(timing_only_summary.total_llm_calls, 2)
             self.assertEqual(timing_only_summary.fidelity_review_calls, 1)
+
+    def test_invalid_initial_dsl_reaches_validation_repair_before_fidelity_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": INVALID_DSL,
+                    "validation_repair": REPAIRED_DSL,
+                    "fidelity_review": "No gaps found.",
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+            classifications = [call.classification for call in client.calls]
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(classifications, ["initial_generation", "validation_repair", "fidelity_review"])
+            self.assertEqual(summary.fidelity_review_calls, 1)
+            self.assertEqual(summary.validation_repair_calls, 1)
+            self.assertLess(classifications.index("validation_repair"), classifications.index("fidelity_review"))
+            self.assertIsNone(result.attempts[0].review_feedback_path)
+            self.assertTrue(result.attempts[0].validation_error_path)
+            self.assertTrue(result.attempts[1].review_feedback_path)
 
     def test_compare_benchmark_summaries_reports_before_after_deltas(self) -> None:
         before = BenchmarkResultSummary(

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Literal, Protocol
@@ -1049,8 +1050,11 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     model: WorkflowModel | None = None
     final_candidate_path: Path | None = None
     initial_dsl_path: Path | None = None
+    review_attempt_no = 0
 
-    for attempt_no in range(1, req.max_attempts + 1):
+    attempt_no = 0
+    while attempt_no < req.max_attempts:
+        attempt_no += 1
         review_feedback_path: Path | None = None
         review_repair_path: Path | None = None
         assumptions_path: Path | None = None
@@ -1104,113 +1108,6 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         if attempt_no == 1:
             with _timed_stage(timings, "file_io", "write initial DSL"):
                 initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
-            for review_attempt_no in range(1, MAX_REVIEW_ATTEMPTS + 1):
-                review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
-                with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
-                    review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
-                with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
-                    review_feedback_path = write_review_feedback_artifact(
-                        run_dir=run_dir,
-                        attempt_no=review_attempt_no,
-                        review_feedback=review_feedback or "No review feedback returned.",
-                    )
-                if not review_feedback or _review_says_no_gaps(review_feedback):
-                    break
-                review_repair_prompt = build_dsl_review_repair_prompt(
-                    markdown=markdown,
-                    previous_output=candidate_source,
-                    review_feedback=review_feedback,
-                )
-                with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
-                    raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
-                with _timed_stage(timings, "file_io", f"write review repair response {review_attempt_no}"):
-                    write_review_repair_response_artifact(
-                        run_dir=run_dir,
-                        attempt_no=review_attempt_no,
-                        raw_response=raw_repair_response,
-                    )
-                try:
-                    candidate_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
-                except Exception as exc:  # noqa: BLE001
-                    validation_error = str(exc)
-                    candidate_path, validation_path = write_validation_attempt_artifacts(
-                        run_dir=run_dir,
-                        attempt_no=attempt_no,
-                        candidate_source="",
-                        validation_error=validation_error,
-                    )
-                    attempts.append(
-                        DslGenerationAttempt(
-                            attempt=attempt_no,
-                            status="empty",
-                            candidate_path=str(candidate_path),
-                            validation_error_path=str(validation_path) if validation_path else None,
-                            validation_error=validation_error,
-                            review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
-                            review_repair_path=str(review_repair_path) if review_repair_path else None,
-                            assumptions_path=str(assumptions_path) if assumptions_path else None,
-                            fix_comments=[],
-                        )
-                    )
-                    return _error_result(
-                        req=req,
-                        input_path=input_path,
-                        run_dir=run_dir,
-                        attempts=attempts,
-                        phase="dsl_generation",
-                        summary=f"Review repair failed: {exc}",
-                        validation_error=validation_error,
-                        dsl_path=initial_dsl_path,
-                        timings=timings,
-                        pipeline_started_at=pipeline_started_at,
-                    )
-                if _review_has_questions(review_feedback) and not qa_pairs:
-                    validation_error = "review repair response missing question/answer pairs for review questions"
-                    candidate_path, validation_path = write_validation_attempt_artifacts(
-                        run_dir=run_dir,
-                        attempt_no=attempt_no,
-                        candidate_source="",
-                        validation_error=validation_error,
-                    )
-                    attempts.append(
-                        DslGenerationAttempt(
-                            attempt=attempt_no,
-                            status="empty",
-                            candidate_path=str(candidate_path),
-                            validation_error_path=str(validation_path) if validation_path else None,
-                            validation_error=validation_error,
-                            review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
-                            review_repair_path=str(review_repair_path) if review_repair_path else None,
-                            assumptions_path=str(assumptions_path) if assumptions_path else None,
-                            fix_comments=[],
-                        )
-                    )
-                    return _error_result(
-                        req=req,
-                        input_path=input_path,
-                        run_dir=run_dir,
-                        attempts=attempts,
-                        phase="dsl_generation",
-                        summary="Review repair failed: missing question answers",
-                        validation_error=validation_error,
-                        dsl_path=initial_dsl_path,
-                        timings=timings,
-                        pipeline_started_at=pipeline_started_at,
-                    )
-                with _timed_stage(timings, "file_io", f"write review repair DSL {review_attempt_no}"):
-                    review_repair_path = write_review_repair_artifact(
-                        run_dir=run_dir,
-                        attempt_no=review_attempt_no,
-                        candidate_source=candidate_source,
-                    )
-                if qa_pairs:
-                    with _timed_stage(timings, "file_io", f"write review assumptions {review_attempt_no}"):
-                        assumptions_path = append_review_assumptions_artifact(
-                            run_dir=run_dir,
-                            attempt_no=review_attempt_no,
-                            qa_pairs=qa_pairs,
-                        )
-                previous_output = candidate_source
 
         with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
             candidate_path, _ = write_validation_attempt_artifacts(
@@ -1264,6 +1161,175 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         previous_output = candidate_source
         warning_hints = list(model.warnings)
         final_candidate_path = candidate_path
+
+        for _ in range(MAX_REVIEW_ATTEMPTS):
+            review_attempt_no += 1
+            review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
+            with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
+                review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
+            with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
+                review_feedback_path = write_review_feedback_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    review_feedback=review_feedback or "No review feedback returned.",
+                )
+            if not review_feedback or _review_says_no_gaps(review_feedback):
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                break
+            review_repair_prompt = build_dsl_review_repair_prompt(
+                markdown=markdown,
+                previous_output=candidate_source,
+                review_feedback=review_feedback,
+            )
+            with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
+                raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
+            with _timed_stage(timings, "file_io", f"write review repair response {review_attempt_no}"):
+                write_review_repair_response_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    raw_response=raw_repair_response,
+                )
+            try:
+                repaired_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
+            except Exception as exc:  # noqa: BLE001
+                validation_error = str(exc)
+                attempt_no += 1
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source="",
+                    validation_error=validation_error,
+                )
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="empty",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path) if validation_path else None,
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=[],
+                    )
+                )
+                return _error_result(
+                    req=req,
+                    input_path=input_path,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    phase="dsl_generation",
+                    summary=f"Review repair failed: {exc}",
+                    validation_error=validation_error,
+                    dsl_path=initial_dsl_path,
+                    timings=timings,
+                    pipeline_started_at=pipeline_started_at,
+                )
+            if _review_has_questions(review_feedback) and not qa_pairs:
+                validation_error = "review repair response missing question/answer pairs for review questions"
+                attempt_no += 1
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source="",
+                    validation_error=validation_error,
+                )
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="empty",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path) if validation_path else None,
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=[],
+                    )
+                )
+                return _error_result(
+                    req=req,
+                    input_path=input_path,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    phase="dsl_generation",
+                    summary="Review repair failed: missing question answers",
+                    validation_error=validation_error,
+                    dsl_path=initial_dsl_path,
+                    timings=timings,
+                    pipeline_started_at=pipeline_started_at,
+                )
+            with _timed_stage(timings, "file_io", f"write review repair DSL {review_attempt_no}"):
+                review_repair_path = write_review_repair_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    candidate_source=repaired_source,
+                )
+            if qa_pairs:
+                with _timed_stage(timings, "file_io", f"write review assumptions {review_attempt_no}"):
+                    assumptions_path = append_review_assumptions_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        qa_pairs=qa_pairs,
+                    )
+
+            attempt_no += 1
+            with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+                candidate_path, _ = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source=repaired_source,
+                    validation_error=None,
+                )
+            fix_comments = extract_fix_comments(repaired_source)
+            try:
+                with _timed_stage(timings, "dsl_validation", f"attempt {attempt_no}"):
+                    model = validate_dsl_source(repaired_source, str(candidate_path))
+            except DslError as exc:
+                validation_error = str(exc)
+                validation_path = run_dir / "dsl_validation_attempts" / f"attempt_{attempt_no}.validation.txt"
+                with _timed_stage(timings, "file_io", f"write validation error {attempt_no}"):
+                    validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="invalid",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path),
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=fix_comments,
+                    )
+                )
+                previous_output = repaired_source
+                warning_hints = []
+                model = None
+                final_candidate_path = None
+                break
+            attempts.append(
+                DslGenerationAttempt(
+                    attempt=attempt_no,
+                    status="valid",
+                    candidate_path=str(candidate_path),
+                    validation_error_path=None,
+                    validation_error=None,
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                    review_repair_path=str(review_repair_path) if review_repair_path else None,
+                    assumptions_path=str(assumptions_path) if assumptions_path else None,
+                    fix_comments=fix_comments,
+                )
+            )
+            candidate_source = repaired_source
+            previous_output = candidate_source
+            warning_hints = list(model.warnings)
+            final_candidate_path = candidate_path
+        if model is None or final_candidate_path is None:
+            continue
         break
 
     if model is None or final_candidate_path is None:

@@ -87,6 +87,25 @@ INVALID_DSL_WITH_FIX_COMMENT = INVALID_DSL.replace(
 )
 
 
+VALID_DSL_WITH_STATUS_REOPENED = VALID_DSL.replace(
+    'status=Enum("ready", "done")',
+    'status=Enum("ready", "done", "reopened")',
+)
+
+
+INVALID_REVIEW_REPAIR_DSL = VALID_DSL_WITH_STATUS_REOPENED.replace(
+    '    Eq(Field("task", "retry_count"), 0),\n',
+    "",
+)
+
+
+VALID_REPAIR_AFTER_INVALID_REVIEW = INVALID_REVIEW_REPAIR_DSL.replace(
+    "init(\n",
+    'init(\n    # FIX attempt 3: restore missing field task.retry_count after review repair\n    Eq(Field("task", "retry_count"), 0),\n',
+    1,
+)
+
+
 class SpecDebuggingMarkdownToTlaTest(unittest.TestCase):
     def test_find_tla_jar_prefers_explicit_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -221,7 +240,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Initialize task.retry_count to 0.\n```",
                     "Review complete. No gaps found. Ready for validation.",
@@ -240,9 +259,10 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
+            self.assertEqual(result.attempt_count, 2)
             self.assertEqual(len(client.prompts), 4)
             self.assertEqual(
-                Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(),
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
                 "Review complete. No gaps found. Ready for validation.",
             )
 
@@ -251,7 +271,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", VALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, VALID_DSL, "No gaps found."])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -277,12 +297,13 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertFalse(result.fairness_sensitive)
             self.assertEqual(result.liveness_classification, "not_applicable")
             self.assertEqual(len(client.prompts), 3)
-            self.assertTrue(result.attempts[0].review_feedback_path)
-            self.assertTrue(Path(result.attempts[0].review_feedback_path or "").exists())
-            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[0].review_feedback_path or "")
-            self.assertEqual(Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(), "No gaps found.")
-            self.assertIsNone(result.attempts[0].review_repair_path)
-            self.assertIsNone(result.attempts[0].assumptions_path)
+            self.assertIsNone(result.attempts[0].review_feedback_path)
+            self.assertTrue(result.attempts[1].review_feedback_path)
+            self.assertTrue(Path(result.attempts[1].review_feedback_path or "").exists())
+            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
+            self.assertEqual(Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertIsNone(result.attempts[1].review_repair_path)
+            self.assertIsNone(result.attempts[1].assumptions_path)
 
     def test_repair_attempt_without_fix_comment_is_rejected_before_later_success(self) -> None:
         valid_attempt_3 = VALID_DSL.replace("# FIX attempt 2:", "# FIX attempt 3:")
@@ -290,7 +311,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", VALID_DSL_WITHOUT_FIX_COMMENT, valid_attempt_3])
+            client = FakeLLMClient([INVALID_DSL, VALID_DSL_WITHOUT_FIX_COMMENT, valid_attempt_3, "No gaps found."])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -314,7 +335,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", INVALID_DSL, INVALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, INVALID_DSL])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -342,7 +363,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", INVALID_DSL_WITH_FIX_COMMENT, VALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, INVALID_DSL_WITH_FIX_COMMENT, VALID_DSL])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -357,12 +378,12 @@ forbidden("cannot_retry_paid_order", when=when=And(
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.attempt_count, 2)
-            self.assertEqual(len(client.prompts), 3)
+            self.assertEqual(len(client.prompts), 2)
             self.assertIn("missing init(...) values for: task.retry_count", result.attempts[0].validation_error or "")
             self.assertIn("missing init(...) values for: task.retry_count", result.attempts[1].validation_error or "")
             self.assertIsNone(result.tla_path)
 
-    def test_review_feedback_loop_can_fix_initial_candidate_before_validation(self) -> None:
+    def test_review_feedback_loop_validates_repaired_candidate_before_finalization(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -370,7 +391,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
@@ -389,28 +410,28 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertEqual(result.attempt_count, 1)
+            self.assertEqual(result.attempt_count, 2)
             self.assertEqual(len(client.prompts), 4)
-            self.assertTrue(result.attempts[0].review_feedback_path)
-            self.assertTrue(result.attempts[0].review_repair_path)
-            self.assertTrue(result.attempts[0].assumptions_path)
+            self.assertTrue(result.attempts[1].review_feedback_path)
+            self.assertTrue(result.attempts[1].review_repair_path)
+            self.assertTrue(result.attempts[1].assumptions_path)
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "initial.dsl.py").exists())
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_2.review.txt").exists())
             self.assertEqual(
-                Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(),
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
                 "No gaps found.",
             )
             self.assertEqual(
-                Path(result.attempts[0].review_repair_path or "").read_text(encoding="utf-8"),
+                Path(result.attempts[1].review_repair_path or "").read_text(encoding="utf-8"),
                 repaired.lstrip("\n"),
             )
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.repair_response.txt").exists())
             self.assertEqual(
-                Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8").strip(),
+                Path(result.attempts[1].assumptions_path or "").read_text(encoding="utf-8").strip(),
                 "attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",
             )
-            self.assertIn("/review_attempts/attempt_1.dsl.py", result.attempts[0].review_repair_path or "")
-            self.assertIn("/dsl_validation_attempts/attempt_1.dsl.py", result.attempts[0].candidate_path or "")
+            self.assertIn("/review_attempts/attempt_1.dsl.py", result.attempts[1].review_repair_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_2.dsl.py", result.attempts[1].candidate_path or "")
 
     def test_review_loop_with_no_questions_skips_assumptions_entry(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -420,7 +441,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count",
                     f"```python\n{repaired.lstrip()}```\n```text\n```",
                     "No gaps found.",
@@ -439,8 +460,46 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertIsNone(result.attempts[0].assumptions_path)
+            self.assertIsNone(result.attempts[1].assumptions_path)
             self.assertFalse((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").exists())
+
+    def test_review_counter_is_monotonic_after_invalid_review_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    "1. Add reopened status.",
+                    f"```python\n{INVALID_REVIEW_REPAIR_DSL.lstrip()}```\n```text\n```",
+                    VALID_REPAIR_AFTER_INVALID_REVIEW,
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=3,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            review_dir = root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts"
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.attempt_count, 3)
+            self.assertEqual((review_dir / "attempt_1.review.txt").read_text(encoding="utf-8").strip(), "1. Add reopened status.")
+            self.assertTrue((review_dir / "attempt_1.dsl.py").exists())
+            self.assertEqual((review_dir / "attempt_2.review.txt").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertFalse((review_dir / "attempt_2.dsl.py").exists())
+            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
+            self.assertIn("/review_attempts/attempt_2.review.txt", result.attempts[2].review_feedback_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_2.dsl.py", result.attempts[1].candidate_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_3.dsl.py", result.attempts[2].candidate_path or "")
 
     def test_review_repair_missing_dsl_block_fails_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -449,7 +508,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", ""),
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
                     "```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Set it to 0.\n```",
                 ]
@@ -478,7 +537,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
                     f"```python\n{repaired.lstrip()}```\n```text\n```",
                 ]
@@ -507,7 +566,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
