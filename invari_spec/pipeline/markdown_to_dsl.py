@@ -28,6 +28,8 @@ from invari_spec.pipeline.result_types import (
     MarkdownToTlaRequest,
     MarkdownToTlaResult,
     PipelineTiming,
+    ReviewFinding,
+    ReviewSummary,
 )
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
 from invari_spec.semantic_dsl.errors import DslError
@@ -319,12 +321,13 @@ def build_dsl_fidelity_review_prompt(*, markdown: str, dsl_source: str) -> str:
             [
                 "You are a formal modeling reviewer checking whether a generated semantic DSL file faithfully captures a prose workflow spec.",
                 "Apply these lenses in order: (1) outcome correctness, (2) construct appropriateness, (3) invariant scoping, (4) state exhaustiveness, (5) terminal completeness, (6) entity/batch scope.",
-                "If there are no substantive modeling gaps, return exactly: No gaps found.",
-                "If there are gaps, for each gap found, output: Why it matters / What to update / What DSL action to take.",
-                "Format each as a numbered change with sub-bullets.",
-                "If any questions remain, list them at the very end under a heading exactly named: Questions:",
-                "Under Questions:, put one question per line in the form: question#N: <text>",
-                "If no questions remain, omit the Questions: section entirely.",
+                "Return only raw JSON or a fenced ```json block with this exact top-level shape:",
+                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required"}]}',
+                "Use severity=blocker only for source-backed fidelity gaps that require automatic DSL repair.",
+                "Use severity=question for open product/modeling questions and severity=suggestion for non-blocking improvements.",
+                "If there are no substantive modeling gaps, use verdict=no_gaps_found and findings=[].",
+                "If there are only questions or suggestions, use verdict=questions_or_suggestions_only.",
+                "Do not include prose outside the JSON.",
                 "Original spec markdown:",
                 "```markdown",
                 markdown.strip(),
@@ -344,22 +347,20 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
         "\n\n".join(
             [
                 "You are repairing a semantic DSL file based on formal modeling review feedback.",
-                "Apply only the changes needed to address the review feedback while preserving unrelated structure.",
-                "First, apply the numbered review changes as-is to the DSL.",
-                "Next, answer every question in the trailing Questions: section conservatively using the markdown and current DSL.",
-                "If a question cannot be deduced, choose the smallest assumption that preserves spec intent.",
-                "Apply any DSL changes implied by those answers as well.",
+                "Apply only the listed severity=blocker findings while preserving unrelated structure.",
+                "Do not repair question-only or suggestion-only findings.",
+                "Do not add assumptions, states, fields, retry policies, actors, or terminal outcomes unless a blocker required_change explicitly requires them.",
                 "Return exactly two fenced blocks and nothing else.",
                 "Begin your response with the ```python fenced block.",
                 "Do not include any prose before the first fence.",
                 "The first fenced block must be ```python and contain only the full corrected DSL file.",
                 "If you cannot improve the DSL, still return the previous DSL unchanged inside the ```python block.",
-                "The second fenced block must be ```text and contain only answered questions in this exact format:",
+                "The second fenced block must be ```text and contain only blocker-linked assumptions in this exact format when needed:",
                 "question#1: ...",
                 "answer#1: ...",
                 "question#2: ...",
                 "answer#2: ...",
-                "If there were no questions to answer, return an empty ```text block.",
+                "If no blocker-linked assumptions are needed, return an empty ```text block.",
                 "Original spec markdown:",
                 "```markdown",
                 markdown.strip(),
@@ -520,6 +521,121 @@ def _parse_review_repair_response(raw: str) -> tuple[str, list[tuple[str, str]]]
     return normalize_common_dsl_syntax(dsl_block).rstrip() + "\n", pairs
 
 
+ALLOWED_REVIEW_VERDICTS = {"no_gaps_found", "blockers_found", "questions_or_suggestions_only"}
+ALLOWED_REVIEW_KINDS = {"fidelity", "assumption", "suggestion"}
+ALLOWED_REVIEW_SEVERITIES = {"blocker", "question", "suggestion"}
+ALLOWED_REVIEW_LENSES = {
+    "outcome_correctness",
+    "construct_appropriateness",
+    "invariant_scoping",
+    "state_exhaustiveness",
+    "terminal_completeness",
+    "entity_batch_scope",
+}
+
+
+def _extract_review_json_payload(raw: str) -> dict:
+    text = raw.strip()
+    if _review_says_no_gaps(text):
+        return {"verdict": "no_gaps_found", "findings": []}
+    fenced = re.findall(r"```([A-Za-z0-9_-]*)\n(.*?)```", text, flags=re.DOTALL)
+    for lang, body in fenced:
+        if lang.strip().lower() == "json":
+            text = body.strip()
+            break
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"review feedback is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("review feedback JSON must be an object")
+    return payload
+
+
+def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]]:
+    payload = _extract_review_json_payload(raw)
+    verdict = str(payload.get("verdict", "")).strip()
+    if verdict not in ALLOWED_REVIEW_VERDICTS:
+        raise ValueError(f"unsupported review verdict: {verdict or '<missing>'}")
+    findings_payload = payload.get("findings")
+    if not isinstance(findings_payload, list):
+        raise ValueError("review feedback JSON must include findings as a list")
+    findings: list[ReviewFinding] = []
+    for idx, finding_payload in enumerate(findings_payload, start=1):
+        if not isinstance(finding_payload, dict):
+            raise ValueError(f"finding {idx} must be an object")
+        missing = [
+            key
+            for key in ("id", "kind", "severity", "lens", "evidence", "required_change")
+            if key not in finding_payload
+        ]
+        if missing:
+            raise ValueError(f"finding {idx} missing required field(s): {', '.join(missing)}")
+        finding_id = str(finding_payload["id"]).strip()
+        kind = str(finding_payload["kind"]).strip()
+        severity = str(finding_payload["severity"]).strip()
+        lens = str(finding_payload["lens"]).strip()
+        evidence = str(finding_payload["evidence"]).strip()
+        required_change = str(finding_payload["required_change"]).strip()
+        if not finding_id:
+            raise ValueError(f"finding {idx} has empty id")
+        if kind not in ALLOWED_REVIEW_KINDS:
+            raise ValueError(f"finding {idx} has unsupported kind: {kind}")
+        if severity not in ALLOWED_REVIEW_SEVERITIES:
+            raise ValueError(f"finding {idx} has unsupported severity: {severity}")
+        if lens not in ALLOWED_REVIEW_LENSES:
+            raise ValueError(f"finding {idx} has unsupported lens: {lens}")
+        if severity == "blocker" and not required_change:
+            raise ValueError(f"finding {idx} blocker missing required_change")
+        findings.append(
+            ReviewFinding(
+                id=finding_id,
+                kind=kind,  # type: ignore[arg-type]
+                severity=severity,  # type: ignore[arg-type]
+                lens=lens,  # type: ignore[arg-type]
+                evidence=evidence,
+                required_change=required_change,
+            )
+        )
+    if verdict == "no_gaps_found" and findings:
+        raise ValueError("no_gaps_found verdict cannot include findings")
+    if verdict == "blockers_found" and not any(finding.severity == "blocker" for finding in findings):
+        raise ValueError("blockers_found verdict requires at least one blocker finding")
+    return verdict, findings
+
+
+def _review_repair_feedback_for_blockers(findings: list[ReviewFinding]) -> str:
+    payload = {
+        "verdict": "blockers_found",
+        "findings": [finding for finding in findings if finding.severity == "blocker"],
+    }
+    return json.dumps(
+        {
+            "verdict": payload["verdict"],
+            "findings": [finding.__dict__ for finding in payload["findings"]],
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _build_review_summary(
+    *,
+    outcome: str,
+    review_rounds: int,
+    repair_rounds: int,
+    blocker_ids: list[str],
+    assumption_count: int,
+) -> ReviewSummary:
+    return ReviewSummary(
+        outcome=outcome,  # type: ignore[arg-type]
+        review_rounds=review_rounds,
+        repair_rounds=repair_rounds,
+        blocker_ids=sorted(dict.fromkeys(blocker_ids)),
+        assumption_count=assumption_count,
+    )
+
+
 def normalize_common_dsl_syntax(source: str) -> str:
     source = re.sub(r'Set\(\s*Var\(\s*"([^"]+)"\s*\)\s*,', r'Set("\1",', source)
     source = re.sub(r'Eq\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,', r'Eq(Var("\1"),', source)
@@ -605,6 +721,36 @@ def write_review_repair_response_artifact(*, run_dir: Path, attempt_no: int, raw
     return response_path
 
 
+def write_review_findings_artifact(*, run_dir: Path, attempt_no: int, verdict: str, findings: list[ReviewFinding]) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    findings_path = attempts_dir / f"attempt_{attempt_no}.findings.json"
+    findings_path.write_text(
+        json.dumps(
+            {
+                "verdict": verdict,
+                "findings": [finding.__dict__ for finding in findings],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return findings_path
+
+
+def write_review_parse_failure_artifact(*, run_dir: Path, attempt_no: int, raw_response: str, error: str) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    failure_path = attempts_dir / f"attempt_{attempt_no}.parse_failure.json"
+    failure_path.write_text(
+        json.dumps({"error": error, "raw_response": raw_response}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return failure_path
+
+
 def append_review_assumptions_artifact(*, run_dir: Path, attempt_no: int, qa_pairs: list[tuple[str, str]]) -> Path:
     attempts_dir = run_dir / "review_attempts"
     attempts_dir.mkdir(parents=True, exist_ok=True)
@@ -688,6 +834,7 @@ def _build_result(
     has_liveness: bool,
     timings: list[PipelineTiming] | None,
     extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     underspecified = _underspecified_assumptions(warnings)
     fairness_sensitive = status == "fail" and has_liveness
@@ -728,6 +875,7 @@ def _build_result(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         timings=list(timings or []),
+        review_summary=review_summary,
     )
 
 
@@ -756,6 +904,7 @@ def _error_result(
     timings: list[PipelineTiming] | None = None,
     pipeline_started_at: float | None = None,
     extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     _ = req
     recorded_timings = list(timings) if timings is not None else None
@@ -783,6 +932,7 @@ def _error_result(
         has_liveness=has_liveness,
         timings=recorded_timings,
         extra_notes=extra_notes,
+        review_summary=review_summary,
     )
     _write_result(result)
     return result
@@ -800,6 +950,7 @@ def _finalize_validated_model(
     timings: list[PipelineTiming] | None = None,
     pipeline_started_at: float | None = None,
     extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     recorded_timings = list(timings) if timings is not None else None
     final_dsl_path = run_dir / "final.dsl.py"
@@ -825,6 +976,7 @@ def _finalize_validated_model(
             timings=recorded_timings,
             pipeline_started_at=pipeline_started_at,
             extra_notes=result_notes,
+            review_summary=review_summary,
         )
 
     tlc_output_path = None
@@ -898,6 +1050,7 @@ def _finalize_validated_model(
                 timings=recorded_timings,
                 pipeline_started_at=pipeline_started_at,
                 extra_notes=result_notes,
+                review_summary=review_summary,
             )
         if summary_thread is not None:
             summary_thread.join()
@@ -930,6 +1083,7 @@ def _finalize_validated_model(
         has_liveness=has_liveness,
         timings=recorded_timings,
         extra_notes=result_notes,
+        review_summary=review_summary,
     )
     _write_result(result)
     return result
@@ -1057,6 +1211,20 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     initial_dsl_path: Path | None = None
     review_attempt_no = 0
     review_capped = False
+    review_outcome = "not_run"
+    review_repair_rounds = 0
+    review_blocker_ids: list[str] = []
+    review_assumption_count = 0
+    review_notes: list[str] = []
+
+    def current_review_summary() -> ReviewSummary:
+        return _build_review_summary(
+            outcome="capped" if review_capped else review_outcome,
+            review_rounds=review_attempt_no,
+            repair_rounds=review_repair_rounds,
+            blocker_ids=review_blocker_ids,
+            assumption_count=review_assumption_count,
+        )
 
     attempt_no = 0
     while attempt_no < req.max_attempts:
@@ -1179,19 +1347,51 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     attempt_no=review_attempt_no,
                     review_feedback=review_feedback or "No review feedback returned.",
                 )
-            if not review_feedback or _review_says_no_gaps(review_feedback):
+            try:
+                verdict, findings = parse_structured_review_feedback(review_feedback)
+                with _timed_stage(timings, "file_io", f"write review findings {review_attempt_no}"):
+                    write_review_findings_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        verdict=verdict,
+                        findings=findings,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                with _timed_stage(timings, "file_io", f"write review parse failure {review_attempt_no}"):
+                    parse_failure_path = write_review_parse_failure_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        raw_response=review_feedback,
+                        error=str(exc),
+                    )
                 attempts[-1] = replace(
                     attempts[-1],
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                 )
+                review_outcome = "review_parse_failed"
+                review_notes.append(f"Fidelity review parse failed: {parse_failure_path}")
                 break
+            blocker_findings = [finding for finding in findings if finding.severity == "blocker"]
+            review_blocker_ids.extend(finding.id for finding in blocker_findings)
+            review_assumption_count += sum(1 for finding in findings if finding.kind == "assumption")
+            if not blocker_findings:
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                review_outcome = "no_gaps_found" if verdict == "no_gaps_found" else "questions_or_suggestions_only"
+                if findings:
+                    review_notes.append(f"Fidelity review recorded {len(findings)} non-blocking finding(s); no repair was run.")
+                break
+            review_outcome = "blockers_found"
             review_repair_prompt = build_dsl_review_repair_prompt(
                 markdown=markdown,
                 previous_output=candidate_source,
-                review_feedback=review_feedback,
+                review_feedback=_review_repair_feedback_for_blockers(blocker_findings),
             )
             with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
                 raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
+            review_repair_rounds += 1
             with _timed_stage(timings, "file_io", f"write review repair response {review_attempt_no}"):
                 write_review_repair_response_artifact(
                     run_dir=run_dir,
@@ -1233,6 +1433,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     dsl_path=initial_dsl_path,
                     timings=timings,
                     pipeline_started_at=pipeline_started_at,
+                    extra_notes=review_notes,
+                    review_summary=current_review_summary(),
                 )
             if _review_has_questions(review_feedback) and not qa_pairs:
                 validation_error = "review repair response missing question/answer pairs for review questions"
@@ -1267,6 +1469,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     dsl_path=initial_dsl_path,
                     timings=timings,
                     pipeline_started_at=pipeline_started_at,
+                    extra_notes=review_notes,
+                    review_summary=current_review_summary(),
                 )
             with _timed_stage(timings, "file_io", f"write review repair DSL {review_attempt_no}"):
                 review_repair_path = write_review_repair_artifact(
@@ -1355,7 +1559,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             warnings=warning_hints,
             timings=timings,
             pipeline_started_at=pipeline_started_at,
-            extra_notes=[REVIEW_CAP_NOTE] if review_capped else None,
+            extra_notes=([REVIEW_CAP_NOTE] if review_capped else []) + review_notes,
+            review_summary=current_review_summary(),
         )
 
     return _finalize_validated_model(
@@ -1368,7 +1573,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         llm_client=client,
         timings=timings,
         pipeline_started_at=pipeline_started_at,
-        extra_notes=[REVIEW_CAP_NOTE] if review_capped else None,
+        extra_notes=([REVIEW_CAP_NOTE] if review_capped else []) + review_notes,
+        review_summary=current_review_summary(),
     )
 
 
@@ -1388,8 +1594,19 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
         f"BUG_CLASSES: {', '.join(payload.get('bug_classes') or ['(none)'])}",
         f"LIVENESS: {payload.get('liveness_classification', 'not_applicable')}",
         f"FAIRNESS_SENSITIVE: {payload.get('fairness_sensitive', False)}",
-        "FIXES:",
     ]
+    review_summary = payload.get("review_summary") or {}
+    if review_summary:
+        blocker_ids = review_summary.get("blocker_ids") or []
+        lines.extend(
+            [
+                f"REVIEW_OUTCOME: {review_summary.get('outcome', '')}",
+                f"REVIEW_ROUNDS: {review_summary.get('review_rounds', 0)}",
+                f"REVIEW_REPAIR_ROUNDS: {review_summary.get('repair_rounds', 0)}",
+                f"REVIEW_BLOCKERS: {', '.join(blocker_ids) if blocker_ids else '(none)'}",
+            ]
+        )
+    lines.append("FIXES:")
     fixes = payload.get("fix_comments") or []
     if fixes:
         lines.extend(f"- {fix}" for fix in fixes)

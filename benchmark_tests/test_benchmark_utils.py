@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,33 @@ REPAIRED_DSL = INVALID_DSL.replace(
     'init(\n    # FIX attempt 2: initialize missing field task.retry_count\n    Eq(Field("task", "retry_count"), 0),\n',
     1,
 )
+
+
+def structured_review(
+    *,
+    severity: str = "blocker",
+    finding_id: str = "semantic_gap",
+    required_change: str = "Update the DSL to cover the missing requirement.",
+) -> str:
+    return json.dumps(
+        {
+            "verdict": "blockers_found" if severity == "blocker" else "questions_or_suggestions_only",
+            "findings": [
+                {
+                    "id": finding_id,
+                    "kind": "fidelity" if severity == "blocker" else "suggestion",
+                    "severity": severity,
+                    "lens": "outcome_correctness",
+                    "evidence": "The markdown contains a source-backed review finding.",
+                    "required_change": required_change if severity == "blocker" else "",
+                }
+            ],
+        }
+    )
+
+
+def fenced_json(payload: str) -> str:
+    return f"```json\n{payload}\n```"
 
 
 class BenchmarkUtilsTest(unittest.TestCase):
@@ -160,8 +188,157 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertTrue(result.attempts[0].validation_error_path)
             self.assertTrue(result.attempts[1].review_feedback_path)
 
+    def test_suggestion_only_review_causes_zero_repair_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": structured_review(severity="suggestion", finding_id="rename_for_clarity"),
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.fidelity_review_calls, 1)
+            self.assertEqual(summary.fidelity_repair_calls, 0)
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "questions_or_suggestions_only")
+            self.assertTrue((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.findings.json").exists())
+            self.assertFalse((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.repair_response.txt").exists())
+
+    def test_question_only_review_causes_zero_repair_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": structured_review(severity="question", finding_id="retry_limit_question"),
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.fidelity_repair_calls, 0)
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "questions_or_suggestions_only")
+
+    def test_blocker_and_mixed_reviews_still_repair_only_for_blockers(self) -> None:
+        mixed_review = json.dumps(
+            {
+                "verdict": "blockers_found",
+                "findings": [
+                    json.loads(structured_review(finding_id="missing_terminal_state"))["findings"][0],
+                    json.loads(structured_review(severity="suggestion", finding_id="rename_for_clarity"))["findings"][0],
+                ],
+            }
+        )
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [mixed_review, "No gaps found."],
+                    "fidelity_repair": repair_response,
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            repair_prompt = [call.prompt for call in client.calls if call.classification == "fidelity_repair"][0]
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.blocker_ids if result.review_summary else [], ["missing_terminal_state"])
+            self.assertIn("missing_terminal_state", repair_prompt)
+            self.assertNotIn("rename_for_clarity", repair_prompt)
+
+    def test_malformed_review_fails_closed_without_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": "This is prose, not JSON.",
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.fidelity_repair_calls, 0)
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "review_parse_failed")
+            self.assertTrue((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.parse_failure.json").exists())
+
+    def test_raw_and_fenced_json_review_outputs_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": fenced_json(structured_review(severity="suggestion", finding_id="document_naming")),
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            findings_payload = json.loads(
+                (output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.findings.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(findings_payload["findings"][0]["id"], "document_naming")
+
     def test_non_converging_fidelity_review_is_capped_at_three_rounds(self) -> None:
-        review_blocker = "1. Still missing a semantic requirement."
+        review_blocker = structured_review()
         repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td) / "generated"
@@ -196,7 +373,7 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertFalse((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_4.review.txt").exists())
 
     def test_capped_invalid_review_repair_reports_cap_note(self) -> None:
-        review_blocker = "1. Still missing a semantic requirement."
+        review_blocker = structured_review()
         valid_repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         invalid_repair_response = f"```python\n{INVALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
@@ -229,7 +406,7 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
 
     def test_capped_tla_lowering_error_reports_cap_note(self) -> None:
-        review_blocker = "1. Still missing a semantic requirement."
+        review_blocker = structured_review()
         repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td) / "generated"

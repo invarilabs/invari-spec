@@ -21,6 +21,8 @@ from invari_spec.pipeline.result_types import (
     MarkdownToTlaRequest,
     MarkdownToTlaResult,
     PipelineTiming,
+    ReviewFinding,
+    ReviewSummary,
 )
 
 __all__ = [
@@ -29,6 +31,8 @@ __all__ = [
     "MarkdownToTlaRequest",
     "MarkdownToTlaResult",
     "PipelineTiming",
+    "ReviewFinding",
+    "ReviewSummary",
     "build_dsl_fidelity_review_prompt",
     "build_dsl_review_repair_prompt",
     "build_initial_markdown_to_dsl_prompt",

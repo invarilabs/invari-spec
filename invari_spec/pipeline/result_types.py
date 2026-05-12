@@ -33,6 +33,42 @@ class PipelineTiming:
 
 
 @dataclass(frozen=True)
+class ReviewFinding:
+    id: str
+    kind: Literal["fidelity", "assumption", "suggestion"]
+    severity: Literal["blocker", "question", "suggestion"]
+    lens: Literal[
+        "outcome_correctness",
+        "construct_appropriateness",
+        "invariant_scoping",
+        "state_exhaustiveness",
+        "terminal_completeness",
+        "entity_batch_scope",
+    ]
+    evidence: str
+    required_change: str
+
+
+@dataclass(frozen=True)
+class ReviewSummary:
+    outcome: Literal[
+        "not_run",
+        "no_gaps_found",
+        "blockers_found",
+        "questions_or_suggestions_only",
+        "review_parse_failed",
+        "capped",
+        "repeated",
+        "drifted",
+        "validation_failed",
+    ]
+    review_rounds: int = 0
+    repair_rounds: int = 0
+    blocker_ids: list[str] = field(default_factory=list)
+    assumption_count: int = 0
+
+
+@dataclass(frozen=True)
 class MarkdownToTlaRequest:
     input_path: Path
     generated_root: Path
@@ -70,9 +106,12 @@ class MarkdownToTlaResult:
     tlc_exit_code: int | None = None
     trace: str = ""
     timings: list[PipelineTiming] = field(default_factory=list)
+    review_summary: ReviewSummary | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         if not self.timings:
             payload.pop("timings", None)
+        if self.review_summary is None:
+            payload.pop("review_summary", None)
         return payload

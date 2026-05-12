@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -106,6 +107,29 @@ VALID_REPAIR_AFTER_INVALID_REVIEW = INVALID_REVIEW_REPAIR_DSL.replace(
 )
 
 
+def structured_review(
+    *,
+    severity: str = "blocker",
+    finding_id: str = "missing_retry_count_init",
+    required_change: str = "Initialize task.retry_count.",
+) -> str:
+    return json.dumps(
+        {
+            "verdict": "blockers_found" if severity == "blocker" else "questions_or_suggestions_only",
+            "findings": [
+                {
+                    "id": finding_id,
+                    "kind": "fidelity" if severity == "blocker" else "suggestion",
+                    "severity": severity,
+                    "lens": "state_exhaustiveness",
+                    "evidence": "The markdown requires a complete task state.",
+                    "required_change": required_change if severity == "blocker" else "",
+                }
+            ],
+        }
+    )
+
+
 class SpecDebuggingMarkdownToTlaTest(unittest.TestCase):
     def test_find_tla_jar_prefers_explicit_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -210,18 +234,19 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("outcome correctness", prompt)
         self.assertIn("entity/batch scope", prompt)
         self.assertIn('workflow("x")', prompt)
-        self.assertIn("Questions:", prompt)
-        self.assertIn("question#N:", prompt)
+        self.assertIn('"verdict"', prompt)
+        self.assertIn('"severity":"blocker | question | suggestion"', prompt)
+        self.assertIn("Do not include prose outside the JSON", prompt)
 
     def test_review_repair_prompt_requires_dsl_only_output(self) -> None:
         prompt = build_dsl_review_repair_prompt(
             markdown="# Spec\n",
             previous_output='workflow("x")\ninit()\n',
-            review_feedback="1. Change something\nQuestions:\nquestion#1: What should x be?",
+            review_feedback=structured_review(required_change="Change x."),
         )
 
-        self.assertIn("First, apply the numbered review changes as-is", prompt)
-        self.assertIn("Next, answer every question", prompt)
+        self.assertIn("Apply only the listed severity=blocker findings", prompt)
+        self.assertIn("Do not repair question-only or suggestion-only findings", prompt)
         self.assertIn("Return exactly two fenced blocks", prompt)
         self.assertIn("Begin your response with the ```python fenced block", prompt)
         self.assertIn("Do not include any prose before the first fence", prompt)
@@ -229,8 +254,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("```python", prompt)
         self.assertIn("```text", prompt)
         self.assertIn("Formal modeling review feedback:", prompt)
-        self.assertIn("question#1:", prompt)
-        self.assertIn("answer#1:", prompt)
+        self.assertIn('"required_change": "Change x."', prompt)
 
     def test_review_loop_stops_when_no_gaps_found_is_in_longer_feedback(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -241,7 +265,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     repaired,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Initialize task.retry_count to 0.\n```",
                     "Review complete. No gaps found. Ready for validation.",
                 ]
@@ -392,7 +416,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     repaired,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                 ]
@@ -442,7 +466,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     repaired,
-                    "1. Missing init for task.retry_count",
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\n```",
                     "No gaps found.",
                 ]
@@ -471,7 +495,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     VALID_DSL,
-                    "1. Add reopened status.",
+                    structured_review(finding_id="add_reopened_status", required_change="Add reopened status."),
                     f"```python\n{INVALID_REVIEW_REPAIR_DSL.lstrip()}```\n```text\n```",
                     VALID_REPAIR_AFTER_INVALID_REVIEW,
                     "No gaps found.",
@@ -492,7 +516,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             review_dir = root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts"
             self.assertEqual(result.status, "pass")
             self.assertEqual(result.attempt_count, 3)
-            self.assertEqual((review_dir / "attempt_1.review.txt").read_text(encoding="utf-8").strip(), "1. Add reopened status.")
+            self.assertIn("add_reopened_status", (review_dir / "attempt_1.review.txt").read_text(encoding="utf-8"))
             self.assertTrue((review_dir / "attempt_1.dsl.py").exists())
             self.assertEqual((review_dir / "attempt_2.review.txt").read_text(encoding="utf-8").strip(), "No gaps found.")
             self.assertFalse((review_dir / "attempt_2.dsl.py").exists())
@@ -509,7 +533,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", ""),
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    structured_review(),
                     "```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Set it to 0.\n```",
                 ]
             )
@@ -529,7 +553,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertEqual(result.phase, "dsl_generation")
             self.assertIn("missing python fenced DSL block", result.validation_error or "")
 
-    def test_review_repair_missing_question_answers_fails_explicitly(self) -> None:
+    def test_malformed_review_feedback_fails_closed_without_repair(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -539,7 +563,6 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
-                    f"```python\n{repaired.lstrip()}```\n```text\n```",
                 ]
             )
 
@@ -554,9 +577,11 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 llm_client=client,
             )
 
-            self.assertEqual(result.status, "error")
-            self.assertEqual(result.phase, "dsl_generation")
-            self.assertIn("missing question/answer pairs", result.validation_error or "")
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(len(client.prompts), 2)
+            self.assertIsNone(result.attempts[0].review_repair_path)
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "review_parse_failed")
+            self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.parse_failure.json").exists())
 
     def test_tlc_run_spawns_assumptions_summary_artifact(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -567,7 +592,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             client = FakeLLMClient(
                 [
                     repaired,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                     "The model assumes task.retry_count starts at 0, which makes the finish path immediately well-defined.",
@@ -704,6 +729,30 @@ action(
             self.assertIn("BUG_CLASSES:", rendered)
             self.assertIn("UNDERSPECIFIED:", rendered)
             self.assertIn("LIVENESS:", rendered)
+
+    def test_render_result_surfaces_review_summary_fields(self) -> None:
+        payload = {
+            "status": "pass",
+            "phase": "complete",
+            "input_path": "SPEC.md",
+            "attempt_count": 1,
+            "bug_classes": [],
+            "review_summary": {
+                "outcome": "questions_or_suggestions_only",
+                "review_rounds": 1,
+                "repair_rounds": 0,
+                "blocker_ids": [],
+                "assumption_count": 0,
+            },
+            "summary": "ok",
+        }
+
+        rendered = render_result(payload, "text")
+
+        self.assertIn("REVIEW_OUTCOME: questions_or_suggestions_only", rendered)
+        self.assertIn("REVIEW_ROUNDS: 1", rendered)
+        self.assertIn("REVIEW_REPAIR_ROUNDS: 0", rendered)
+        self.assertIn("REVIEW_BLOCKERS: (none)", rendered)
 
 
 if __name__ == "__main__":
