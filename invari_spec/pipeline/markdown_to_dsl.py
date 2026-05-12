@@ -43,7 +43,8 @@ DEFAULT_FIXTURE_ORDER = (
     "infinite_retry",
     "unreachable_success",
 )
-MAX_REVIEW_ATTEMPTS = 10
+MAX_REVIEW_ATTEMPTS = 3
+REVIEW_CAP_NOTE = f"Fidelity review stopped after reaching the cap of {MAX_REVIEW_ATTEMPTS} rounds."
 FIX_COMMENT_RE = re.compile(r"^\s*#\s*FIX attempt \d+:\s*.+$")
 
 DSL_CANONICAL_FORMS = """
@@ -754,6 +755,7 @@ def _error_result(
     has_liveness: bool = False,
     timings: list[PipelineTiming] | None = None,
     pipeline_started_at: float | None = None,
+    extra_notes: list[str] | None = None,
 ) -> MarkdownToTlaResult:
     _ = req
     recorded_timings = list(timings) if timings is not None else None
@@ -780,7 +782,7 @@ def _error_result(
         trace=trace,
         has_liveness=has_liveness,
         timings=recorded_timings,
-        extra_notes=None,
+        extra_notes=extra_notes,
     )
     _write_result(result)
     return result
@@ -797,12 +799,14 @@ def _finalize_validated_model(
     llm_client: LLMClient | None = None,
     timings: list[PipelineTiming] | None = None,
     pipeline_started_at: float | None = None,
+    extra_notes: list[str] | None = None,
 ) -> MarkdownToTlaResult:
     recorded_timings = list(timings) if timings is not None else None
     final_dsl_path = run_dir / "final.dsl.py"
     with _timed_stage(recorded_timings, "file_io", "write final DSL"):
         shutil.copyfile(final_candidate_path, final_dsl_path)
     has_liveness = bool(model.obligations)
+    result_notes: list[str] = list(extra_notes or [])
 
     try:
         with _timed_stage(recorded_timings, "tla_lowering"):
@@ -820,6 +824,7 @@ def _finalize_validated_model(
             has_liveness=has_liveness,
             timings=recorded_timings,
             pipeline_started_at=pipeline_started_at,
+            extra_notes=result_notes,
         )
 
     tlc_output_path = None
@@ -829,7 +834,6 @@ def _finalize_validated_model(
     phase = "complete"
     summary = "Generated validated DSL, TLA+, and CFG"
     warnings = list(model.warnings)
-    extra_notes: list[str] = []
     assumptions_summary_path: Path | None = None
     assumptions_summary_error: str | None = None
     summary_thread: threading.Thread | None = None
@@ -874,9 +878,9 @@ def _finalize_validated_model(
                 summary_thread.join()
             tlc_output_path.write_text(str(exc).rstrip() + "\n", encoding="utf-8")
             if assumptions_summary_path is not None:
-                extra_notes.append(f"Assumptions summary: {assumptions_summary_path}")
+                result_notes.append(f"Assumptions summary: {assumptions_summary_path}")
             elif assumptions_summary_error:
-                extra_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
+                result_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
             return _error_result(
                 req=req,
                 input_path=input_path,
@@ -893,13 +897,14 @@ def _finalize_validated_model(
                 has_liveness=has_liveness,
                 timings=recorded_timings,
                 pipeline_started_at=pipeline_started_at,
+                extra_notes=result_notes,
             )
         if summary_thread is not None:
             summary_thread.join()
         if assumptions_summary_path is not None:
-            extra_notes.append(f"Assumptions summary: {assumptions_summary_path}")
+            result_notes.append(f"Assumptions summary: {assumptions_summary_path}")
         elif assumptions_summary_error:
-            extra_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
+            result_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
 
     all_fix_comments: list[str] = []
     for attempt in attempts:
@@ -924,7 +929,7 @@ def _finalize_validated_model(
         trace=trace,
         has_liveness=has_liveness,
         timings=recorded_timings,
-        extra_notes=extra_notes,
+        extra_notes=result_notes,
     )
     _write_result(result)
     return result
@@ -1051,6 +1056,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     final_candidate_path: Path | None = None
     initial_dsl_path: Path | None = None
     review_attempt_no = 0
+    review_capped = False
 
     attempt_no = 0
     while attempt_no < req.max_attempts:
@@ -1162,7 +1168,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         warning_hints = list(model.warnings)
         final_candidate_path = candidate_path
 
-        for _ in range(MAX_REVIEW_ATTEMPTS):
+        for review_round_index in range(1, MAX_REVIEW_ATTEMPTS + 1):
             review_attempt_no += 1
             review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
             with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
@@ -1290,6 +1296,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     model = validate_dsl_source(repaired_source, str(candidate_path))
             except DslError as exc:
                 validation_error = str(exc)
+                if review_round_index == MAX_REVIEW_ATTEMPTS:
+                    review_capped = True
                 validation_path = run_dir / "dsl_validation_attempts" / f"attempt_{attempt_no}.validation.txt"
                 with _timed_stage(timings, "file_io", f"write validation error {attempt_no}"):
                     validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
@@ -1328,6 +1336,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             previous_output = candidate_source
             warning_hints = list(model.warnings)
             final_candidate_path = candidate_path
+            if review_round_index == MAX_REVIEW_ATTEMPTS:
+                review_capped = True
         if model is None or final_candidate_path is None:
             continue
         break
@@ -1345,6 +1355,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             warnings=warning_hints,
             timings=timings,
             pipeline_started_at=pipeline_started_at,
+            extra_notes=[REVIEW_CAP_NOTE] if review_capped else None,
         )
 
     return _finalize_validated_model(
@@ -1357,6 +1368,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         llm_client=client,
         timings=timings,
         pipeline_started_at=pipeline_started_at,
+        extra_notes=[REVIEW_CAP_NOTE] if review_capped else None,
     )
 
 

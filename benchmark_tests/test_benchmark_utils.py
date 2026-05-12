@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from benchmark_utils import (
     LIVE_DOC_APPROVAL_BENCHMARK_COMMAND,
@@ -158,6 +159,102 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertIsNone(result.attempts[0].review_feedback_path)
             self.assertTrue(result.attempts[0].validation_error_path)
             self.assertTrue(result.attempts[1].review_feedback_path)
+
+    def test_non_converging_fidelity_review_is_capped_at_three_rounds(self) -> None:
+        review_blocker = "1. Still missing a semantic requirement."
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_repair": [repair_response, repair_response, repair_response],
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+            review_and_repair_calls = summary.fidelity_review_calls + summary.fidelity_repair_calls
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.fidelity_review_calls, 3)
+            self.assertEqual(summary.fidelity_repair_calls, 3)
+            self.assertLessEqual(review_and_repair_calls, 6)
+            self.assertGreaterEqual(20 - review_and_repair_calls, 14)
+            self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
+            self.assertTrue((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_3.review.txt").exists())
+            self.assertFalse((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_4.review.txt").exists())
+
+    def test_capped_invalid_review_repair_reports_cap_note(self) -> None:
+        review_blocker = "1. Still missing a semantic requirement."
+        valid_repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        invalid_repair_response = f"```python\n{INVALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_repair": [valid_repair_response, valid_repair_response, invalid_repair_response],
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    max_attempts=5,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.phase, "dsl_validation")
+            self.assertEqual(summary.fidelity_review_calls, 3)
+            self.assertEqual(summary.fidelity_repair_calls, 3)
+            self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
+
+    def test_capped_tla_lowering_error_reports_cap_note(self) -> None:
+        review_blocker = "1. Still missing a semantic requirement."
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_repair": [repair_response, repair_response, repair_response],
+                }
+            )
+            with patch("invari_spec.pipeline.markdown_to_dsl.write_tla_artifacts", side_effect=RuntimeError("boom")):
+                result = convert_markdown_to_tla(
+                    MarkdownToTlaRequest(
+                        input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                        generated_root=output_dir,
+                        run_tlc=False,
+                        cwd=ROOT,
+                        collect_timings=True,
+                    ),
+                    llm_client=client,
+                )
+
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.phase, "tla_lowering")
+            self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
 
     def test_compare_benchmark_summaries_reports_before_after_deltas(self) -> None:
         before = BenchmarkResultSummary(
