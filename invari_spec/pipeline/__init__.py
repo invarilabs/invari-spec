@@ -18,6 +18,7 @@ from invari_spec.pipeline.markdown_to_dsl import (
 from invari_spec.pipeline.result_types import (
     DslGenerationAttempt,
     Fixture,
+    AssumptionDecision,
     MarkdownToTlaRequest,
     MarkdownToTlaResult,
     PipelineTiming,
@@ -28,6 +29,7 @@ from invari_spec.pipeline.result_types import (
 __all__ = [
     "DslGenerationAttempt",
     "Fixture",
+    "AssumptionDecision",
     "MarkdownToTlaRequest",
     "MarkdownToTlaResult",
     "PipelineTiming",

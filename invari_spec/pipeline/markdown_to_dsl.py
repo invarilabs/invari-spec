@@ -23,6 +23,7 @@ except Exception:  # noqa: BLE001
     OpenAI = None  # type: ignore[assignment]
 
 from invari_spec.pipeline.result_types import (
+    AssumptionDecision,
     DslGenerationAttempt,
     Fixture,
     MarkdownToTlaRequest,
@@ -315,19 +316,46 @@ def build_initial_markdown_to_dsl_prompt(markdown: str, fixtures: list[Fixture],
     ).strip() + "\n"
 
 
-def build_dsl_fidelity_review_prompt(*, markdown: str, dsl_source: str) -> str:
+def _format_assumption_ledger(decisions: list[AssumptionDecision]) -> str:
+    if not decisions:
+        return "No prior assumptions have been selected."
+    payload = [
+        {
+            "id": decision.id,
+            "finding_id": decision.finding_id,
+            "status": decision.status,
+            "selected_choice": decision.selected_choice,
+            "choices": decision.choices,
+            "evidence": decision.evidence,
+        }
+        for decision in decisions
+    ]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def build_dsl_fidelity_review_prompt(
+    *,
+    markdown: str,
+    dsl_source: str,
+    assumption_ledger: list[AssumptionDecision] | None = None,
+) -> str:
+    ledger = list(assumption_ledger or [])
     return (
         "\n\n".join(
             [
                 "You are a formal modeling reviewer checking whether a generated semantic DSL file faithfully captures a prose workflow spec.",
                 "Apply these lenses in order: (1) outcome correctness, (2) construct appropriateness, (3) invariant scoping, (4) state exhaustiveness, (5) terminal completeness, (6) entity/batch scope.",
                 "Return only raw JSON or a fenced ```json block with this exact top-level shape:",
-                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required"}]}',
+                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required","choices":["viable interpretation A","viable interpretation B"],"selected_choice":"chosen conservative interpretation when this finding is an underspecified assumption"}]}',
                 "Use severity=blocker only for source-backed fidelity gaps that require automatic DSL repair.",
                 "Use severity=question for open product/modeling questions and severity=suggestion for non-blocking improvements.",
+                "When the source is underspecified, include choices for the viable interpretations and selected_choice for the conservative default. Treat that as an assumption finding unless source text proves the DSL wrong.",
+                "Honor the binding assumption ledger below. Do not reopen a ledger decision as a fresh blocker unless the markdown directly contradicts it; then use kind=assumption and severity=blocker with evidence for the contradiction.",
                 "If there are no substantive modeling gaps, use verdict=no_gaps_found and findings=[].",
                 "If there are only questions or suggestions, use verdict=questions_or_suggestions_only.",
                 "Do not include prose outside the JSON.",
+                "Binding assumption ledger:",
+                _format_assumption_ledger(ledger),
                 "Original spec markdown:",
                 "```markdown",
                 markdown.strip(),
@@ -342,7 +370,14 @@ def build_dsl_fidelity_review_prompt(*, markdown: str, dsl_source: str) -> str:
     )
 
 
-def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, review_feedback: str) -> str:
+def build_dsl_review_repair_prompt(
+    *,
+    markdown: str,
+    previous_output: str,
+    review_feedback: str,
+    assumption_ledger: list[AssumptionDecision] | None = None,
+) -> str:
+    ledger = list(assumption_ledger or [])
     return (
         "\n\n".join(
             [
@@ -350,6 +385,7 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
                 "Apply only the listed severity=blocker findings while preserving unrelated structure.",
                 "Do not repair question-only or suggestion-only findings.",
                 "Do not add assumptions, states, fields, retry policies, actors, or terminal outcomes unless a blocker required_change explicitly requires them.",
+                "Honor the binding assumption ledger. If a blocker can be repaired in more than one way, choose the ledger-selected interpretation.",
                 "Return exactly two fenced blocks and nothing else.",
                 "Begin your response with the ```python fenced block.",
                 "Do not include any prose before the first fence.",
@@ -371,6 +407,8 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
                 "```",
                 "Formal modeling review feedback:",
                 review_feedback.strip(),
+                "Binding assumption ledger:",
+                _format_assumption_ledger(ledger),
             ]
         ).strip()
         + "\n"
@@ -566,7 +604,7 @@ def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]
             raise ValueError(f"finding {idx} must be an object")
         missing = [
             key
-            for key in ("id", "kind", "severity", "lens", "evidence", "required_change")
+            for key in ("id", "kind", "severity", "lens", "evidence")
             if key not in finding_payload
         ]
         if missing:
@@ -576,9 +614,19 @@ def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]
         severity = str(finding_payload["severity"]).strip()
         lens = str(finding_payload["lens"]).strip()
         evidence = str(finding_payload["evidence"]).strip()
-        required_change = str(finding_payload["required_change"]).strip()
+        required_change = str(finding_payload.get("required_change", "")).strip()
+        choices_payload = finding_payload.get("choices", [])
+        if choices_payload is None:
+            choices_payload = []
+        if not isinstance(choices_payload, list) or not all(isinstance(choice, str) for choice in choices_payload):
+            raise ValueError(f"finding {idx} choices must be a list of strings")
+        choices = [choice.strip() for choice in choices_payload if choice.strip()]
+        selected_choice_payload = finding_payload.get("selected_choice")
+        selected_choice = str(selected_choice_payload).strip() if selected_choice_payload is not None else None
         if not finding_id:
             raise ValueError(f"finding {idx} has empty id")
+        if kind in ALLOWED_REVIEW_LENSES:
+            kind = "fidelity"
         if kind not in ALLOWED_REVIEW_KINDS:
             raise ValueError(f"finding {idx} has unsupported kind: {kind}")
         if severity not in ALLOWED_REVIEW_SEVERITIES:
@@ -587,6 +635,10 @@ def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]
             raise ValueError(f"finding {idx} has unsupported lens: {lens}")
         if severity == "blocker" and not required_change:
             raise ValueError(f"finding {idx} blocker missing required_change")
+        if selected_choice and choices and selected_choice not in choices:
+            choices.append(selected_choice)
+        if choices and not selected_choice:
+            selected_choice = choices[0]
         findings.append(
             ReviewFinding(
                 id=finding_id,
@@ -595,6 +647,8 @@ def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]
                 lens=lens,  # type: ignore[arg-type]
                 evidence=evidence,
                 required_change=required_change,
+                choices=choices,
+                selected_choice=selected_choice,
             )
         )
     if verdict == "no_gaps_found" and findings:
@@ -626,6 +680,9 @@ def _build_review_summary(
     repair_rounds: int,
     blocker_ids: list[str],
     assumption_count: int,
+    assumption_decisions: list[AssumptionDecision] | None = None,
+    assumption_ledger_path: str | None = None,
+    repairs_avoided_by_ledger: int = 0,
 ) -> ReviewSummary:
     return ReviewSummary(
         outcome=outcome,  # type: ignore[arg-type]
@@ -633,7 +690,39 @@ def _build_review_summary(
         repair_rounds=repair_rounds,
         blocker_ids=sorted(dict.fromkeys(blocker_ids)),
         assumption_count=assumption_count,
+        assumption_decisions=list(assumption_decisions or []),
+        assumption_ledger_path=assumption_ledger_path,
+        repairs_avoided_by_ledger=repairs_avoided_by_ledger,
     )
+
+
+def _assumption_decisions_from_findings(
+    *,
+    findings: list[ReviewFinding],
+    attempt_no: int,
+    existing: list[AssumptionDecision],
+) -> list[AssumptionDecision]:
+    existing_ids = {decision.finding_id for decision in existing}
+    decisions: list[AssumptionDecision] = []
+    for finding in findings:
+        if finding.id in existing_ids:
+            continue
+        if not finding.choices and not finding.selected_choice:
+            continue
+        selected_choice = finding.selected_choice or finding.choices[0]
+        choices = list(finding.choices or [selected_choice])
+        decisions.append(
+            AssumptionDecision(
+                id=f"A{len(existing) + len(decisions) + 1}",
+                finding_id=finding.id,
+                source_attempt=attempt_no,
+                lens=finding.lens,
+                evidence=finding.evidence,
+                choices=choices,
+                selected_choice=selected_choice,
+            )
+        )
+    return decisions
 
 
 def normalize_common_dsl_syntax(source: str) -> str:
@@ -738,6 +827,25 @@ def write_review_findings_artifact(*, run_dir: Path, attempt_no: int, verdict: s
         encoding="utf-8",
     )
     return findings_path
+
+
+def write_assumption_ledger_artifact(*, run_dir: Path, decisions: list[AssumptionDecision]) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = attempts_dir / "assumption_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "mode": "default",
+                "decisions": [decision.__dict__ for decision in decisions],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return ledger_path
 
 
 def write_review_parse_failure_artifact(*, run_dir: Path, attempt_no: int, raw_response: str, error: str) -> Path:
@@ -1216,6 +1324,9 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     review_blocker_ids: list[str] = []
     review_assumption_count = 0
     review_notes: list[str] = []
+    assumption_decisions: list[AssumptionDecision] = []
+    assumption_ledger_path: Path | None = None
+    repairs_avoided_by_ledger = 0
 
     def current_review_summary() -> ReviewSummary:
         return _build_review_summary(
@@ -1224,6 +1335,9 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             repair_rounds=review_repair_rounds,
             blocker_ids=review_blocker_ids,
             assumption_count=review_assumption_count,
+            assumption_decisions=assumption_decisions,
+            assumption_ledger_path=str(assumption_ledger_path) if assumption_ledger_path else None,
+            repairs_avoided_by_ledger=repairs_avoided_by_ledger,
         )
 
     attempt_no = 0
@@ -1338,7 +1452,12 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
 
         for review_round_index in range(1, MAX_REVIEW_ATTEMPTS + 1):
             review_attempt_no += 1
-            review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
+            active_ledger = assumption_decisions if req.assumption_mode == "default" else []
+            review_prompt = build_dsl_fidelity_review_prompt(
+                markdown=markdown,
+                dsl_source=candidate_source,
+                assumption_ledger=active_ledger,
+            )
             with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
                 review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
             with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
@@ -1374,6 +1493,19 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             blocker_findings = [finding for finding in findings if finding.severity == "blocker"]
             review_blocker_ids.extend(finding.id for finding in blocker_findings)
             review_assumption_count += sum(1 for finding in findings if finding.kind == "assumption")
+            if req.assumption_mode == "default":
+                new_decisions = _assumption_decisions_from_findings(
+                    findings=findings,
+                    attempt_no=review_attempt_no,
+                    existing=assumption_decisions,
+                )
+                if new_decisions:
+                    assumption_decisions.extend(new_decisions)
+                    with _timed_stage(timings, "file_io", f"write assumption ledger {review_attempt_no}"):
+                        assumption_ledger_path = write_assumption_ledger_artifact(
+                            run_dir=run_dir,
+                            decisions=assumption_decisions,
+                        )
             if not blocker_findings:
                 attempts[-1] = replace(
                     attempts[-1],
@@ -1382,12 +1514,15 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 review_outcome = "no_gaps_found" if verdict == "no_gaps_found" else "questions_or_suggestions_only"
                 if findings:
                     review_notes.append(f"Fidelity review recorded {len(findings)} non-blocking finding(s); no repair was run.")
+                if active_ledger:
+                    repairs_avoided_by_ledger += 1
                 break
             review_outcome = "blockers_found"
             review_repair_prompt = build_dsl_review_repair_prompt(
                 markdown=markdown,
                 previous_output=candidate_source,
                 review_feedback=_review_repair_feedback_for_blockers(blocker_findings),
+                assumption_ledger=assumption_decisions if req.assumption_mode == "default" else [],
             )
             with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
                 raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
@@ -1598,14 +1733,20 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
     review_summary = payload.get("review_summary") or {}
     if review_summary:
         blocker_ids = review_summary.get("blocker_ids") or []
+        decisions = review_summary.get("assumption_decisions") or []
         lines.extend(
             [
                 f"REVIEW_OUTCOME: {review_summary.get('outcome', '')}",
                 f"REVIEW_ROUNDS: {review_summary.get('review_rounds', 0)}",
                 f"REVIEW_REPAIR_ROUNDS: {review_summary.get('repair_rounds', 0)}",
                 f"REVIEW_BLOCKERS: {', '.join(blocker_ids) if blocker_ids else '(none)'}",
+                f"ASSUMPTION_DECISIONS: {len(decisions)}",
+                f"ASSUMPTION_LEDGER: {review_summary.get('assumption_ledger_path') or ''}",
+                f"REPAIRS_AVOIDED_BY_LEDGER: {review_summary.get('repairs_avoided_by_ledger', 0)}",
             ]
         )
+        for decision in decisions:
+            lines.append(f"- {decision.get('id')}: {decision.get('selected_choice')}")
     lines.append("FIXES:")
     fixes = payload.get("fix_comments") or []
     if fixes:

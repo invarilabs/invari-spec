@@ -31,6 +31,12 @@ def _add_pipeline_args(parser: argparse.ArgumentParser, *, file_required: bool) 
     parser.add_argument("--prompt-path", help="Optional replacement prompt file.")
     parser.add_argument("--tla-jar-path", help="Path to tla2tools.jar.")
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--assumption-mode",
+        choices=("default", "off"),
+        default="default",
+        help="How review handles underspecified workflow choices.",
+    )
     tlc_group = parser.add_mutually_exclusive_group()
     tlc_group.add_argument("--run-tlc", dest="run_tlc", action="store_true", default=True)
     tlc_group.add_argument("--no-run-tlc", dest="run_tlc", action="store_false")
@@ -48,6 +54,7 @@ def _request_from_args(args: argparse.Namespace) -> MarkdownToTlaRequest:
         run_tlc=args.run_tlc,
         cwd=Path.cwd(),
         collect_timings=args.command == "benchmark",
+        assumption_mode=args.assumption_mode,
     )
 
 

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_file
 from invari_spec.pipeline import (
+    AssumptionDecision,
     MarkdownToTlaRequest,
     build_dsl_fidelity_review_prompt,
     build_dsl_review_repair_prompt,
@@ -20,7 +21,7 @@ from invari_spec.pipeline import (
     normalize_common_dsl_syntax,
     normalize_llm_dsl_output,
 )
-from invari_spec.pipeline.markdown_to_dsl import _find_tla_jar
+from invari_spec.pipeline.markdown_to_dsl import _find_tla_jar, parse_structured_review_feedback
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,20 +113,25 @@ def structured_review(
     severity: str = "blocker",
     finding_id: str = "missing_retry_count_init",
     required_change: str = "Initialize task.retry_count.",
+    choices: list[str] | None = None,
+    selected_choice: str | None = None,
 ) -> str:
+    finding = {
+        "id": finding_id,
+        "kind": "fidelity" if severity == "blocker" else "suggestion",
+        "severity": severity,
+        "lens": "state_exhaustiveness",
+        "evidence": "The markdown requires a complete task state.",
+        "required_change": required_change if severity == "blocker" else "",
+    }
+    if choices is not None:
+        finding["choices"] = choices
+    if selected_choice is not None:
+        finding["selected_choice"] = selected_choice
     return json.dumps(
         {
             "verdict": "blockers_found" if severity == "blocker" else "questions_or_suggestions_only",
-            "findings": [
-                {
-                    "id": finding_id,
-                    "kind": "fidelity" if severity == "blocker" else "suggestion",
-                    "severity": severity,
-                    "lens": "state_exhaustiveness",
-                    "evidence": "The markdown requires a complete task state.",
-                    "required_change": required_change if severity == "blocker" else "",
-                }
-            ],
+            "findings": [finding],
         }
     )
 
@@ -237,6 +243,28 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn('"verdict"', prompt)
         self.assertIn('"severity":"blocker | question | suggestion"', prompt)
         self.assertIn("Do not include prose outside the JSON", prompt)
+        self.assertIn("Binding assumption ledger", prompt)
+
+    def test_fidelity_review_prompt_carries_assumption_ledger(self) -> None:
+        prompt = build_dsl_fidelity_review_prompt(
+            markdown="# Spec\n",
+            dsl_source='workflow("x")\ninit()\n',
+            assumption_ledger=[
+                AssumptionDecision(
+                    id="A1",
+                    finding_id="manual_review_gate",
+                    source_attempt=1,
+                    lens="state_exhaustiveness",
+                    evidence="Manual review semantics are underspecified.",
+                    choices=["manual review is separate from approval", "manual review counts as approval"],
+                    selected_choice="manual review is separate from approval",
+                )
+            ],
+        )
+
+        self.assertIn("manual_review_gate", prompt)
+        self.assertIn("manual review is separate from approval", prompt)
+        self.assertIn("Do not reopen a ledger decision as a fresh blocker", prompt)
 
     def test_review_repair_prompt_requires_dsl_only_output(self) -> None:
         prompt = build_dsl_review_repair_prompt(
@@ -255,6 +283,104 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("```text", prompt)
         self.assertIn("Formal modeling review feedback:", prompt)
         self.assertIn('"required_change": "Change x."', prompt)
+        self.assertIn("Binding assumption ledger", prompt)
+
+    def test_assumption_ledger_is_persisted_and_carried_to_next_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: ambiguous manual review\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    structured_review(
+                        finding_id="manual_review_gate",
+                        required_change="Route manual review through the selected gate.",
+                        choices=["manual review is separate from approval", "manual review counts as approval"],
+                        selected_choice="manual review is separate from approval",
+                    ),
+                    f"```python\n{VALID_DSL}```\n```text\n```",
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            ledger_path = root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumption_ledger.json"
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.status, "pass")
+            self.assertTrue(ledger_path.exists())
+            self.assertEqual(ledger_payload["decisions"][0]["finding_id"], "manual_review_gate")
+            self.assertEqual(ledger_payload["decisions"][0]["selected_choice"], "manual review is separate from approval")
+            self.assertIn("manual review is separate from approval", client.prompts[2])
+            self.assertIn("manual review is separate from approval", client.prompts[3])
+            self.assertEqual(len(result.review_summary.assumption_decisions if result.review_summary else []), 1)
+            self.assertEqual(result.review_summary.assumption_ledger_path if result.review_summary else None, str(ledger_path))
+
+    def test_review_choice_selected_choice_can_extend_declared_choices(self) -> None:
+        review = structured_review(
+            choices=["path A", "path B"],
+            selected_choice="path C",
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertIn("path C", findings[0].choices)
+        self.assertEqual(findings[0].selected_choice, "path C")
+
+    def test_non_blocking_assumption_finding_may_omit_required_change(self) -> None:
+        review = json.dumps(
+            {
+                "verdict": "questions_or_suggestions_only",
+                "findings": [
+                    {
+                        "id": "manual_review_gate",
+                        "kind": "assumption",
+                        "severity": "question",
+                        "lens": "state_exhaustiveness",
+                        "evidence": "Manual review semantics are underspecified.",
+                        "choices": ["separate approval", "counts as approval"],
+                        "selected_choice": "separate approval",
+                    }
+                ],
+            }
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertEqual(findings[0].required_change, "")
+        self.assertEqual(findings[0].selected_choice, "separate approval")
+
+    def test_lens_value_in_review_kind_is_normalized_to_fidelity(self) -> None:
+        review = json.dumps(
+            {
+                "verdict": "blockers_found",
+                "findings": [
+                    {
+                        "id": "validation_gap",
+                        "kind": "outcome_correctness",
+                        "severity": "blocker",
+                        "lens": "invariant_scoping",
+                        "evidence": "The DSL skips a required validation gate.",
+                        "required_change": "Add the missing validation gate.",
+                    }
+                ],
+            }
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertEqual(findings[0].kind, "fidelity")
 
     def test_review_loop_stops_when_no_gaps_found_is_in_longer_feedback(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")

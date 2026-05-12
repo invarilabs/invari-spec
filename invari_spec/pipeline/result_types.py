@@ -47,6 +47,20 @@ class ReviewFinding:
     ]
     evidence: str
     required_change: str
+    choices: list[str] = field(default_factory=list)
+    selected_choice: str | None = None
+
+
+@dataclass(frozen=True)
+class AssumptionDecision:
+    id: str
+    finding_id: str
+    source_attempt: int
+    lens: str
+    evidence: str
+    choices: list[str]
+    selected_choice: str
+    status: Literal["selected", "accepted", "contradicted_by_source", "needs_new_variant"] = "selected"
 
 
 @dataclass(frozen=True)
@@ -66,6 +80,9 @@ class ReviewSummary:
     repair_rounds: int = 0
     blocker_ids: list[str] = field(default_factory=list)
     assumption_count: int = 0
+    assumption_decisions: list[AssumptionDecision] = field(default_factory=list)
+    assumption_ledger_path: str | None = None
+    repairs_avoided_by_ledger: int = 0
 
 
 @dataclass(frozen=True)
@@ -80,6 +97,7 @@ class MarkdownToTlaRequest:
     run_tlc: bool = True
     cwd: Path = Path.cwd()
     collect_timings: bool = False
+    assumption_mode: Literal["off", "default"] = "default"
 
 
 @dataclass(frozen=True)

@@ -64,20 +64,25 @@ def structured_review(
     severity: str = "blocker",
     finding_id: str = "semantic_gap",
     required_change: str = "Update the DSL to cover the missing requirement.",
+    choices: list[str] | None = None,
+    selected_choice: str | None = None,
 ) -> str:
+    finding = {
+        "id": finding_id,
+        "kind": "fidelity" if severity == "blocker" else "suggestion",
+        "severity": severity,
+        "lens": "outcome_correctness",
+        "evidence": "The markdown contains a source-backed review finding.",
+        "required_change": required_change if severity == "blocker" else "",
+    }
+    if choices is not None:
+        finding["choices"] = choices
+    if selected_choice is not None:
+        finding["selected_choice"] = selected_choice
     return json.dumps(
         {
             "verdict": "blockers_found" if severity == "blocker" else "questions_or_suggestions_only",
-            "findings": [
-                {
-                    "id": finding_id,
-                    "kind": "fidelity" if severity == "blocker" else "suggestion",
-                    "severity": severity,
-                    "lens": "outcome_correctness",
-                    "evidence": "The markdown contains a source-backed review finding.",
-                    "required_change": required_change if severity == "blocker" else "",
-                }
-            ],
+            "findings": [finding],
         }
     )
 
@@ -242,6 +247,46 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertEqual(result.status, "pass")
             self.assertEqual(summary.fidelity_repair_calls, 0)
             self.assertEqual(result.review_summary.outcome if result.review_summary else None, "questions_or_suggestions_only")
+
+    def test_assumption_ledger_converges_after_selected_choice_is_carried_forward(self) -> None:
+        review_with_choice = structured_review(
+            finding_id="manual_review_gate",
+            required_change="Apply the selected manual-review interpretation.",
+            choices=["manual review is separate from approval", "manual review counts as approval"],
+            selected_choice="manual review is separate from approval",
+        )
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [review_with_choice, "No gaps found."],
+                    "fidelity_repair": repair_response,
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+            second_review_prompt = [call.prompt for call in client.calls if call.classification == "fidelity_review"][1]
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.fidelity_review_calls, 2)
+            self.assertEqual(summary.fidelity_repair_calls, 1)
+            self.assertEqual(len(result.review_summary.assumption_decisions if result.review_summary else []), 1)
+            self.assertIn("manual review is separate from approval", second_review_prompt)
+            self.assertTrue(
+                (output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "assumption_ledger.json").exists()
+            )
 
     def test_blocker_and_mixed_reviews_still_repair_only_for_blockers(self) -> None:
         mixed_review = json.dumps(
