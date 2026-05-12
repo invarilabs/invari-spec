@@ -563,6 +563,58 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "initial.dsl.py").exists())
             self.assertIn("/dsl_validation_attempts/attempt_1.dsl.py", result.attempts[0].candidate_path or "")
 
+    def test_existing_dsl_file_surfaces_tla_lowering_warnings(self) -> None:
+        dsl_source = '''
+workflow("warning_resume")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+    emits=[
+        "finish_notification_sent",
+    ],
+    ensures=[
+        Eq(Field("task", "status"), "done"),
+    ],
+)
+'''
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: resume\n", encoding="utf-8")
+            dsl = root / "attempt_1.dsl.py"
+            dsl.write_text(dsl_source, encoding="utf-8")
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    dsl_file=dsl,
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=FakeLLMClient([""]),
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertTrue(any(w.startswith("W_TLA_EMITS_NOT_CHECKED") for w in result.warnings))
+            self.assertTrue(any(w.startswith("W_TLA_ENSURES_NOT_CHECKED") for w in result.warnings))
+            self.assertTrue(result.tla_path)
+            tla = Path(result.tla_path or "").read_text(encoding="utf-8")
+            self.assertNotIn("finish_notification_sent", tla)
+            self.assertNotIn("EventDomain", tla)
+
     def test_resume_mode_preserves_exploration_warnings(self) -> None:
         warned_dsl = '''
 workflow("warned_resume")

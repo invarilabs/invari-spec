@@ -5,6 +5,7 @@ import re
 from invari_spec.semantic_dsl.errors import DslLoweringError
 from invari_spec.semantic_dsl.model import (
     AnyOfExpr,
+    ActionDecl,
     BoolType,
     CallExpr,
     CollectionType,
@@ -30,6 +31,10 @@ from invari_spec.semantic_dsl.model import (
     VarRef,
     WorkflowModel,
 )
+
+MAX_LOWERED_EVENTS = 10
+EVENT_EMITTED_VAR = "emitted"
+EVENT_SEEN_VAR = "seen_events"
 
 
 def lower_to_tla(model: WorkflowModel, *, module_name: str | None = None) -> str:
@@ -57,10 +62,53 @@ def build_cfg(model: WorkflowModel) -> str:
     return "\n".join(lines)
 
 
+def tla_lowering_warnings(model: WorkflowModel) -> list[str]:
+    checked_events = _checked_event_names(model)
+    emitted_events = _emitted_event_names(model)
+    unchecked_events = emitted_events - checked_events
+    warnings: list[str] = []
+    if emitted_events:
+        warnings.append(
+            "W_TLA_EVENT_SCOPE: "
+            f"emitted_events={len(emitted_events)}; "
+            f"lowered_events={len(checked_events)}; "
+            f"unreferenced_events_ignored={len(unchecked_events)}"
+        )
+    for action in model.actions:
+        if action.ensures:
+            warnings.append(
+                f"W_TLA_ENSURES_NOT_CHECKED: action {action.name} has ensures[...] post-conditions; "
+                "TLA lowering does not check them today. Intended future path: Z3/static contract checking."
+            )
+        unchecked_emits = [event for event in action.emits if event not in checked_events]
+        if unchecked_emits:
+            warnings.append(
+                f"W_TLA_EMITS_NOT_CHECKED: action {action.name} has emits[...] effects/events not referenced "
+                f"by event predicates and not tracked by TLA today: {', '.join(unchecked_emits)}. "
+                "See INV-67 for event semantics."
+            )
+    return warnings
+
+
 class _Lowerer:
     def __init__(self, model: WorkflowModel, *, module_name: str | None = None) -> None:
         self.model = model
         self.module_name = _module_name(module_name or model.name)
+        self.checked_events = tuple(sorted(_checked_event_names(model)))
+        missing_events = sorted(set(self.checked_events) - _emitted_event_names(model))
+        if missing_events:
+            raise DslLoweringError(
+                "event predicate references event(s) never emitted by any action: " + ", ".join(missing_events)
+            )
+        if len(self.checked_events) > MAX_LOWERED_EVENTS:
+            raise DslLoweringError(
+                f"event predicates reference {len(self.checked_events)} event(s), exceeding "
+                f"MAX_LOWERED_EVENTS={MAX_LOWERED_EVENTS}; reduce checked events to prevent TLA state explosion"
+            )
+        if self.checked_events and (EVENT_EMITTED_VAR in model.entities or EVENT_EMITTED_VAR in model.vars):
+            raise DslLoweringError(f"event lowering requires reserved state name {EVENT_EMITTED_VAR!r}")
+        if self.checked_events and (EVENT_SEEN_VAR in model.entities or EVENT_SEEN_VAR in model.vars):
+            raise DslLoweringError(f"event lowering requires reserved state name {EVENT_SEEN_VAR!r}")
 
     def lower(self) -> str:
         if not self.model.actions:
@@ -80,7 +128,7 @@ class _Lowerer:
         ]
 
         for action in self.model.actions:
-            lines.extend(self._action(action_name=action.name, changes=action.changes, requires=action.requires))
+            lines.extend(self._action(action))
             lines.append("")
 
         lines.extend(self._next())
@@ -96,6 +144,8 @@ class _Lowerer:
 
     def _domain_operators(self) -> list[str]:
         lines: list[str] = []
+        if self.checked_events:
+            lines.append(f"EventDomain == {{{', '.join(_literal(event) for event in self.checked_events)}}}")
         seen_named: set[str] = set()
         for entity in self.model.entities.values():
             for field_name, type_ref in entity.fields.items():
@@ -119,6 +169,8 @@ class _Lowerer:
 
     def _variables(self) -> list[str]:
         names = list(self.model.entities) + list(self.model.vars)
+        if self.checked_events:
+            names.extend([EVENT_EMITTED_VAR, EVENT_SEEN_VAR])
         return [f"VARIABLES {', '.join(names)}", "", f"vars == << {', '.join(names)} >>"]
 
     def _type_ok(self) -> list[str]:
@@ -129,6 +181,9 @@ class _Lowerer:
             clauses.append(f"{entity.name} \\in [ {fields} ]")
         for var in self.model.vars.values():
             clauses.append(f"{var.name} \\in {self._type_expr(var.type_ref, var.name, None)}")
+        if self.checked_events:
+            clauses.append(f"{EVENT_EMITTED_VAR} \\in SUBSET EventDomain")
+            clauses.append(f"{EVENT_SEEN_VAR} \\in SUBSET EventDomain")
         if not clauses:
             return ["TypeOk == TRUE"]
         lines.extend(f"  /\\ {clause}" for clause in clauses)
@@ -194,6 +249,9 @@ class _Lowerer:
                     record_fields = ", ".join(f"{field} |-> {self._expr(fields[field])}" for field in entity.fields)
                     clauses.append(f"{entity_name} = [{record_fields}]")
         clauses.extend(scalar_clauses)
+        if self.checked_events:
+            clauses.append(f"{EVENT_EMITTED_VAR} = {{}}")
+            clauses.append(f"{EVENT_SEEN_VAR} = {{}}")
         return clauses
 
     def _init_value_as_set(self, value: Expr, entity_name: str, field_name: str) -> str:
@@ -209,19 +267,33 @@ class _Lowerer:
             return None
         return lhs.ref, rhs
 
-    def _action(self, *, action_name: str, changes: tuple[Update, ...], requires: tuple[Expr, ...]) -> list[str]:
-        op_name = _operator_name(action_name)
+    def _action(self, action: ActionDecl) -> list[str]:
+        op_name = _operator_name(action.name)
         lines = [f"{op_name} =="]
-        clauses = [self._expr(expr) for expr in requires]
-        clauses.extend(self._updates(changes))
+        clauses = [self._expr(expr) for expr in action.requires]
+        clauses.extend(self._updates(action.changes))
 
-        unchanged = self._unchanged_vars(changes)
+        if self.checked_events:
+            event_set = self._event_set(action.emits)
+            clauses.append(f"{EVENT_EMITTED_VAR}' = {event_set}")
+            if event_set == "{}":
+                clauses.append(f"{EVENT_SEEN_VAR}' = {EVENT_SEEN_VAR}")
+            else:
+                clauses.append(f"{EVENT_SEEN_VAR}' = {EVENT_SEEN_VAR} \\cup {EVENT_EMITTED_VAR}'")
+
+        unchanged = self._unchanged_vars(action.changes)
         if unchanged:
             clauses.append(f"UNCHANGED << {', '.join(unchanged)} >>")
         if not clauses:
             clauses.append("TRUE")
         lines.extend(f"  /\\ {clause}" for clause in clauses)
         return lines
+
+    def _event_set(self, emitted_events: tuple[str, ...]) -> str:
+        lowered = [event for event in emitted_events if event in self.checked_events]
+        if not lowered:
+            return "{}"
+        return "{" + ", ".join(_literal(event) for event in sorted(lowered)) + "}"
 
     def _updates(self, changes: tuple[Update, ...]) -> list[str]:
         scalar_updates: list[str] = []
@@ -345,6 +417,12 @@ class _Lowerer:
             return f"({args[0]} \\cup {{{args[1]}}})"
         if op == "RemoveItem":
             return f"({args[0]} \\ {{{args[1]}}})"
+        if op == "Emitted":
+            event_name = self._one_literal_string(expr, op)
+            return f"({_literal(event_name)} \\in {EVENT_EMITTED_VAR})"
+        if op == "SeenEvent":
+            event_name = self._one_literal_string(expr, op)
+            return f"({_literal(event_name)} \\in {EVENT_SEEN_VAR})"
         if op == "Changed":
             ref = self._one_ref(expr, op)
             return f"{self._ref(ref, primed=True)} # {self._ref(ref, primed=False)}"
@@ -362,6 +440,11 @@ class _Lowerer:
         if len(expr.args) != 1 or not isinstance(expr.args[0], RefExpr):
             raise DslLoweringError(f"{op}(...) expects one Var(...) or Field(...) reference")
         return expr.args[0].ref
+
+    def _one_literal_string(self, expr: CallExpr, op: str) -> str:
+        if len(expr.args) != 1 or not isinstance(expr.args[0], LiteralExpr) or not isinstance(expr.args[0].value, str):
+            raise DslLoweringError(f"{op}(...) expects one string event name")
+        return expr.args[0].value
 
     def _ref(self, ref: Ref, *, primed: bool) -> str:
         suffix = "'" if primed else ""
@@ -382,6 +465,47 @@ def _type_contains_collection(type_ref: TypeRef) -> bool:
     if isinstance(type_ref, CollectionType):
         return True
     return False
+
+
+def _checked_event_names(model: WorkflowModel) -> set[str]:
+    names: set[str] = set()
+    for expr in _model_exprs(model):
+        names.update(_event_names_in_expr(expr))
+    return names
+
+
+def _emitted_event_names(model: WorkflowModel) -> set[str]:
+    return {event for action in model.actions for event in action.emits}
+
+
+def _model_exprs(model: WorkflowModel) -> list[Expr]:
+    exprs: list[Expr] = []
+    exprs.extend(model.init)
+    for action in model.actions:
+        exprs.extend(action.requires)
+        exprs.extend(action.ensures)
+    exprs.extend(inv.predicate for inv in model.invariants)
+    exprs.extend(f.predicate for f in model.forbiddens)
+    for obligation in model.obligations:
+        exprs.append(obligation.trigger)
+        exprs.append(obligation.must_eventually)
+    for completion in model.completion_requires:
+        exprs.append(completion.outcome)
+        exprs.append(completion.condition)
+    return exprs
+
+
+def _event_names_in_expr(expr: Expr) -> set[str]:
+    if not isinstance(expr, CallExpr):
+        return set()
+    names: set[str] = set()
+    if expr.op in {"Emitted", "SeenEvent"} and len(expr.args) == 1:
+        arg = expr.args[0]
+        if isinstance(arg, LiteralExpr) and isinstance(arg.value, str):
+            names.add(arg.value)
+    for arg in expr.args:
+        names.update(_event_names_in_expr(arg))
+    return names
 
 
 def _literal(value: str | int | bool) -> str:

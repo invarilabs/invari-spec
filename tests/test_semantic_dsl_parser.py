@@ -283,6 +283,124 @@ action(
         model = parse_dsl_source(source)
         self.assertEqual(model.warnings, ())
 
+    def test_parses_string_action_emits(self) -> None:
+        source = '''
+workflow("events")
+
+entity("refund", Record(
+    status=Enum("requested", "refunded"),
+))
+
+init(
+    Eq(Field("refund", "status"), "requested"),
+)
+
+action(
+    "process_refund",
+    changes=[
+        SetField("refund", "status", "refunded"),
+    ],
+    emits=[
+        "refund_payment_issued",
+    ],
+)
+
+obligation(
+    "payment_was_issued",
+    trigger=Eq(Field("refund", "status"), "refunded"),
+    must_eventually=SeenEvent("refund_payment_issued"),
+)
+'''
+        model = parse_dsl_source(source)
+
+        self.assertEqual(model.actions[0].emits, ("refund_payment_issued",))
+
+    def test_rejects_non_string_action_emits(self) -> None:
+        source = '''
+workflow("events")
+
+entity("refund", Record(
+    status=Enum("requested", "refunded"),
+))
+
+init(
+    Eq(Field("refund", "status"), "requested"),
+)
+
+action(
+    "process_refund",
+    changes=[
+        SetField("refund", "status", "refunded"),
+    ],
+    emits=[
+        Field("refund", "status"),
+    ],
+)
+'''
+        with self.assertRaises(DslParseError):
+            parse_dsl_source(source)
+
+    def test_rejects_unknown_event_predicate(self) -> None:
+        source = '''
+workflow("events")
+
+entity("refund", Record(
+    status=Enum("requested", "refunded"),
+))
+
+init(
+    Eq(Field("refund", "status"), "requested"),
+)
+
+action(
+    "process_refund",
+    changes=[
+        SetField("refund", "status", "refunded"),
+    ],
+)
+
+obligation(
+    "payment_was_issued",
+    trigger=Eq(Field("refund", "status"), "refunded"),
+    must_eventually=SeenEvent("refund_payment_issued"),
+)
+'''
+        with self.assertRaisesRegex(DslTypeError, "never emitted"):
+            parse_dsl_source(source)
+
+    def test_rejects_too_many_checked_events(self) -> None:
+        event_values = ", ".join(f'"event_{idx}"' for idx in range(11))
+        must_eventually = "Or(" + ", ".join(f'SeenEvent("event_{idx}")' for idx in range(11)) + ")"
+        source = f'''
+workflow("many_events")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+    emits=[
+        {event_values},
+    ],
+)
+
+obligation(
+    "too_many_events",
+    trigger=Eq(Field("task", "status"), "done"),
+    must_eventually={must_eventually},
+)
+'''
+        with self.assertRaisesRegex(DslTypeError, "MAX_LOWERED_EVENTS"):
+            parse_dsl_source(source)
+
 
 if __name__ == "__main__":
     unittest.main()

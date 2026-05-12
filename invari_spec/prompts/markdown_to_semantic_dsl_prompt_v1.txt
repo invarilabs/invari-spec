@@ -52,7 +52,7 @@ Required DSL function formats:
 - Collection(Type)
 - IntRange(lo, hi)
 - init(predicate1, predicate2, ...)
-- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
+- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=["event_name", ...], ensures=[predicate, ...])
 - invariant("invariant_name", predicate)
 - forbidden("forbidden_name", when=predicate)
 - obligation("obligation_name", trigger=predicate, must_eventually=predicate)
@@ -67,6 +67,8 @@ Required DSL function formats:
 - Or(predicate1, predicate2, ...)
 - Not(predicate)
 - Implies(condition, consequence)
+- Emitted("event_name")
+- SeenEvent("event_name")
 - Add(a, b)
 - Sub(a, b)
 - Lt(a, b)
@@ -96,6 +98,9 @@ Modeling rules:
 - Initialize every declared field and variable in init(...).
 - Convert workflow steps into action(...) declarations.
 - Put current-state guards in requires=[...].
+- Put externally visible effects in emits=[...] only when a property needs to reason about that effect.
+- Use Emitted("event_name") or SeenEvent("event_name") only for events that appear in some action emits=[...].
+- Do not emit one event for every ordinary state transition.
 - Put state updates in changes=[...].
 - Model uncertain external outcomes as Bool or Enum state fields and separate guarded actions.
 - Include properties for completion, retries, fallback, invariants, or success reachability when the markdown states them.

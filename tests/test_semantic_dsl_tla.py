@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
+from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source, tla_lowering_warnings
 from test_semantic_dsl_parser import REVIEW_WORKFLOW
 
 
@@ -268,6 +268,181 @@ action(
         self.assertTrue(model.warnings)
         self.assertIn("PaymentAttemptSucceeds ==", tla)
         self.assertIn("SPECIFICATION Spec", cfg)
+
+    def test_lowers_checked_events_to_bounded_event_state(self) -> None:
+        model = parse_dsl_source(
+            '''
+workflow("refund_events")
+
+entity("refund", Record(
+    status=Enum("requested", "refunded", "notified"),
+))
+
+init(
+    Eq(Field("refund", "status"), "requested"),
+)
+
+action(
+    "process_refund",
+    requires=[
+        Eq(Field("refund", "status"), "requested"),
+    ],
+    changes=[
+        SetField("refund", "status", "refunded"),
+    ],
+    emits=[
+        "refund_payment_issued",
+        "ledger_entry_created",
+    ],
+)
+
+action(
+    "send_confirmation",
+    requires=[
+        Eq(Field("refund", "status"), "refunded"),
+    ],
+    changes=[
+        SetField("refund", "status", "notified"),
+    ],
+    emits=[
+        "refund_confirmation_sent",
+    ],
+)
+
+obligation(
+    "refund_payment_eventually_notifies_user",
+    trigger=Emitted("refund_payment_issued"),
+    must_eventually=Emitted("refund_confirmation_sent"),
+)
+
+invariant(
+    "notification_only_after_refund_payment",
+    Implies(
+        Emitted("refund_confirmation_sent"),
+        SeenEvent("refund_payment_issued"),
+    ),
+)
+'''
+        )
+        tla = lower_to_tla(model)
+        cfg = build_cfg(model)
+        warnings = tla_lowering_warnings(model)
+
+        self.assertIn('EventDomain == {"refund_confirmation_sent", "refund_payment_issued"}', tla)
+        self.assertNotIn("ledger_entry_created", tla)
+        self.assertIn("VARIABLES refund, emitted, seen_events", tla)
+        self.assertIn("vars == << refund, emitted, seen_events >>", tla)
+        self.assertIn("emitted \\in SUBSET EventDomain", tla)
+        self.assertIn("seen_events \\in SUBSET EventDomain", tla)
+        self.assertIn("emitted = {}", tla)
+        self.assertIn("seen_events = {}", tla)
+        self.assertIn('emitted\' = {"refund_payment_issued"}', tla)
+        self.assertIn("seen_events' = seen_events \\cup emitted'", tla)
+        self.assertIn('emitted\' = {"refund_confirmation_sent"}', tla)
+        self.assertIn('("refund_payment_issued" \\in emitted)', tla)
+        self.assertIn('("refund_confirmation_sent" \\in emitted)', tla)
+        self.assertIn('("refund_payment_issued" \\in seen_events)', tla)
+        self.assertIn("RefundPaymentEventuallyNotifiesUser", cfg)
+        self.assertIn("NotificationOnlyAfterRefundPayment", cfg)
+        self.assertTrue(any(w.startswith("W_TLA_EMITS_NOT_CHECKED: action process_refund") for w in warnings))
+
+    def test_unchecked_emits_do_not_change_generated_tla(self) -> None:
+        with_emit = parse_dsl_source(
+            '''
+workflow("unchecked_emit")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+    emits=[
+        "finish_notification_sent",
+    ],
+)
+'''
+        )
+        without_emit = parse_dsl_source(
+            '''
+workflow("unchecked_emit")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+)
+'''
+        )
+
+        self.assertEqual(lower_to_tla(with_emit), lower_to_tla(without_emit))
+        warnings = tla_lowering_warnings(with_emit)
+        self.assertTrue(any(w.startswith("W_TLA_EMITS_NOT_CHECKED") for w in warnings))
+
+    def test_ensures_warn_but_do_not_change_generated_tla(self) -> None:
+        with_ensures = parse_dsl_source(
+            '''
+workflow("ensure_warning")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+    ensures=[
+        Eq(Field("task", "status"), "done"),
+    ],
+)
+'''
+        )
+        without_ensures = parse_dsl_source(
+            '''
+workflow("ensure_warning")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+)
+'''
+        )
+
+        self.assertEqual(lower_to_tla(with_ensures), lower_to_tla(without_ensures))
+        warnings = tla_lowering_warnings(with_ensures)
+        self.assertTrue(any(w.startswith("W_TLA_ENSURES_NOT_CHECKED") for w in warnings))
 
 
 if __name__ == "__main__":

@@ -57,7 +57,11 @@ _EXPR_OPS = {
     "Unchanged",
     "AddItem",
     "RemoveItem",
+    "Emitted",
+    "SeenEvent",
 }
+
+MAX_LOWERED_EVENTS = 10
 
 _EXPLORATION_BRANCH_NAME_PATTERNS = (
     re.compile(r".*_succeeds$"),
@@ -127,6 +131,7 @@ class _Builder:
         self._validate_expr_shapes()
         self._validate_all_state_initialized()
         self._validate_no_changed_in_invariants()
+        self._validate_event_references()
         self._validate_action_updates()
         self._collect_exploration_warnings()
         return WorkflowModel(
@@ -193,7 +198,7 @@ class _Builder:
         kwargs = self._kwargs(call)
         requires = self._expr_list(kwargs.pop("requires", None), "requires")
         changes = self._update_list(kwargs.pop("changes", None), "changes")
-        emits = self._expr_list(kwargs.pop("emits", None), "emits")
+        emits = self._event_list(kwargs.pop("emits", None), "emits")
         ensures = self._expr_list(kwargs.pop("ensures", None), "ensures")
         if kwargs:
             raise self._parse_error(call, f"unsupported action keyword(s): {', '.join(sorted(kwargs))}")
@@ -381,6 +386,16 @@ class _Builder:
             raise self._parse_error(node, f"{label}= must be a list")
         return tuple(self._parse_expr(item) for item in node.elts)
 
+    def _event_list(self, node: ast.AST | None, label: str) -> tuple[str, ...]:
+        if node is None:
+            return tuple()
+        if not isinstance(node, ast.List):
+            raise self._parse_error(node, f"{label}= must be a list")
+        events = tuple(self._string_arg(item, f"{label} event") for item in node.elts)
+        if len(set(events)) != len(events):
+            raise self._parse_error(node, f"{label}= contains duplicate event names")
+        return events
+
     def _update_list(self, node: ast.AST | None, label: str) -> tuple[Update, ...]:
         if node is None:
             return tuple()
@@ -449,6 +464,9 @@ class _Builder:
             raise DslTypeError(f"{self.source_name}: {expr.op}(...) expects at least one argument")
         if expr.op in {"Changed", "Unchanged"} and not isinstance(expr.args[0], RefExpr):
             raise DslTypeError(f"{self.source_name}: {expr.op}(...) expects Var(...) or Field(...)")
+        if expr.op in {"Emitted", "SeenEvent"}:
+            if len(expr.args) != 1 or not self._literal_string(expr.args[0]):
+                raise DslTypeError(f"{self.source_name}: {expr.op}(...) expects one string event name")
         for arg in expr.args:
             self._validate_expr_shape(arg)
 
@@ -472,6 +490,21 @@ class _Builder:
                 raise DslTypeError(
                     f"{self.source_name}: invariant {inv.name!r} cannot use Changed(...) or Unchanged(...)"
                 )
+
+    def _validate_event_references(self) -> None:
+        emitted = self._emitted_event_names()
+        checked = self._checked_event_names()
+        missing = sorted(checked - emitted)
+        if missing:
+            raise DslTypeError(
+                f"{self.source_name}: event predicate references event(s) never emitted by any action: "
+                + ", ".join(missing)
+            )
+        if len(checked) > MAX_LOWERED_EVENTS:
+            raise DslTypeError(
+                f"{self.source_name}: event predicates reference {len(checked)} event(s), exceeding "
+                f"MAX_LOWERED_EVENTS={MAX_LOWERED_EVENTS}; reduce checked events to prevent TLA state explosion"
+            )
 
     def _validate_action_updates(self) -> None:
         for action in self.actions:
@@ -665,7 +698,6 @@ class _Builder:
         exprs.extend(self.init_exprs or tuple())
         for action in self.actions:
             exprs.extend(action.requires)
-            exprs.extend(action.emits)
             exprs.extend(action.ensures)
         exprs.extend(inv.predicate for inv in self.invariants)
         exprs.extend(f.predicate for f in self.forbiddens)
@@ -676,6 +708,27 @@ class _Builder:
             exprs.append(completion.outcome)
             exprs.append(completion.condition)
         return exprs
+
+    def _emitted_event_names(self) -> set[str]:
+        return {event for action in self.actions for event in action.emits}
+
+    def _checked_event_names(self) -> set[str]:
+        names: set[str] = set()
+        for expr in self._all_exprs():
+            names.update(self._event_names_in_expr(expr))
+        return names
+
+    def _event_names_in_expr(self, expr: Expr) -> set[str]:
+        if not isinstance(expr, CallExpr):
+            return set()
+        names: set[str] = set()
+        if expr.op in {"Emitted", "SeenEvent"} and len(expr.args) == 1:
+            event_name = self._literal_string(expr.args[0])
+            if event_name:
+                names.add(event_name)
+        for arg in expr.args:
+            names.update(self._event_names_in_expr(arg))
+        return names
 
     def _refs_in_expr(self, expr: Expr) -> list[Ref]:
         if isinstance(expr, RefExpr):

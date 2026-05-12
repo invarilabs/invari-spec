@@ -118,7 +118,7 @@ class ActionDecl:
     name: str
     requires: tuple[Expr, ...]
     changes: tuple[Update, ...]
-    emits: tuple[Expr, ...]
+    emits: tuple[str, ...]
     ensures: tuple[Expr, ...]
 
 

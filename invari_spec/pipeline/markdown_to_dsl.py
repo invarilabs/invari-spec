@@ -20,7 +20,7 @@ except Exception:  # noqa: BLE001
     OpenAI = None  # type: ignore[assignment]
 
 from invari_spec.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
-from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
+from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source, tla_lowering_warnings
 from invari_spec.semantic_dsl.errors import DslError
 from invari_spec.semantic_dsl.model import WorkflowModel
 
@@ -43,7 +43,7 @@ Canonical DSL forms:
 - entity("entity_name", Record(field_name=Type, ...))
 - var("var_name", Type)
 - init(predicate1, predicate2, ...)
-- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
+- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=["event_name", ...], ensures=[predicate, ...])
 - invariant("name", predicate)
 - forbidden("name", when=predicate)
 - obligation("name", trigger=predicate, must_eventually=predicate)
@@ -788,6 +788,7 @@ def _finalize_validated_model(
     phase = "complete"
     summary = "Generated validated DSL, TLA+, and CFG"
     warnings = list(model.warnings)
+    warnings.extend(tla_lowering_warnings(model))
     extra_notes: list[str] = []
     assumptions_summary_path: Path | None = None
     assumptions_summary_error: str | None = None
