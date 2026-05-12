@@ -8,7 +8,7 @@ entity("task", Record(
 
 init(
     Eq(Field("task", "status"), "ready"),
-    Eq(Field("task", "service_succeeds"), False),
+    Eq(Field("task", "service_succeeds"), AnyOf(Bool)),
     Eq(Field("task", "failure_handled"), False),
 )
 

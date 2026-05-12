@@ -71,6 +71,12 @@ _EXPLORATION_BRANCH_NAME_PATTERNS = (
     re.compile(r".*_allowed$"),
     re.compile(r".*_retry$"),
     re.compile(r".*_valid$"),
+    # External check outcome patterns
+    re.compile(r".*_violation$"),
+    re.compile(r".*_passed$"),
+    re.compile(r".*_approved$"),
+    re.compile(r"is_.*"),
+    re.compile(r"has_.*"),
 )
 
 _WORKFLOW_PROGRESS_STATUSES = {"CREATED", "PAID", "FAILED", "SHIPPED", "CANCELLED", "FALLBACK", "SUCCEEDED"}
@@ -129,6 +135,7 @@ class _Builder:
         self._validate_all_state_initialized()
         self._validate_no_changed_in_invariants()
         self._validate_action_updates()
+        self._validate_frozen_bool_guard_fields_use_anyof()
         self._collect_exploration_warnings()
         return WorkflowModel(
             name=self.workflow_name,
@@ -541,6 +548,36 @@ class _Builder:
                 mapping[entity_name] = candidate
         return mapping
 
+    def _validate_frozen_bool_guard_fields_use_anyof(self) -> None:
+        init_assigned = self._collect_init_assigned_refs()
+        guard_reads = self._collect_guard_reads()
+        changed = self._collect_changed_refs()
+        read_refs = {ref for refs in guard_reads.values() for ref in refs}
+        for ref_key in sorted(read_refs):
+            if ref_key not in init_assigned or ref_key in changed:
+                continue
+            if isinstance(init_assigned[ref_key], AnyOfExpr):
+                continue
+            if not self._ref_is_bool_type(ref_key):
+                continue
+            if not self._looks_like_branch_selector(ref_key):
+                continue
+            raise DslTypeError(
+                f"{self.source_name}: {ref_key} represents an uncertain external outcome — "
+                "it is a Bool field used in action guards but never changed by any action. "
+                "Use AnyOf(Bool) in init(...) instead of a concrete value so TLC explores both branches."
+            )
+
+    def _ref_is_bool_type(self, ref_key: str) -> bool:
+        if "." in ref_key:
+            entity_name, field_name = ref_key.split(".", 1)
+            entity = self.entities.get(entity_name)
+            if entity is None:
+                return False
+            return isinstance(entity.fields.get(field_name), BoolType)
+        var_decl = self.vars.get(ref_key)
+        return var_decl is not None and isinstance(var_decl.type_ref, BoolType)
+
     def _warn_on_frozen_outcome_variables(self) -> None:
         init_assigned = self._collect_init_assigned_refs()
         guard_reads = self._collect_guard_reads()
@@ -553,6 +590,8 @@ class _Builder:
                 continue
             if not self._looks_like_branch_selector(ref_key):
                 continue
+            if self._ref_is_bool_type(ref_key):
+                continue  # Bool outcome fields are enforced as errors by _validate_frozen_bool_guard_fields_use_anyof
             self.warnings.append(
                 f"W_EXPLORATION_FROZEN_OUTCOME: {ref_key} is initialized in init, used in action guards, and never changed; "
                 "this may freeze one future branch and make success or failure states unreachable"

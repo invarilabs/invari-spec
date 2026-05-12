@@ -252,35 +252,24 @@ completion_requires(
             '''
 workflow("warned_model")
 
-entity("payment", Record(
-    status=Enum("pending", "success", "failed"),
-    payment_succeeds=Bool,
+entity("order", Record(
+    status=Enum("CREATED", "FAILED"),
 ))
 
+var("order_exists", Bool)
+
 init(
-    Eq(Field("payment", "status"), "pending"),
-    Eq(Field("payment", "payment_succeeds"), False),
+    Eq(Field("order", "status"), "CREATED"),
+    Eq(Var("order_exists"), False),
 )
 
 action(
-    "payment_attempt_succeeds",
+    "process_order",
     requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Field("payment", "payment_succeeds"),
+        Not(Var("order_exists")),
     ],
     changes=[
-        SetField("payment", "status", "success"),
-    ],
-)
-
-action(
-    "payment_attempt_fails",
-    requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Not(Field("payment", "payment_succeeds")),
-    ],
-    changes=[
-        SetField("payment", "status", "failed"),
+        Set("order_exists", True),
     ],
 )
 '''
@@ -289,7 +278,7 @@ action(
         cfg = build_cfg(model)
 
         self.assertTrue(model.warnings)
-        self.assertIn("PaymentAttemptSucceeds ==", tla)
+        self.assertIn("ProcessOrder ==", tla)
         self.assertIn("SPECIFICATION Spec", cfg)
 
 

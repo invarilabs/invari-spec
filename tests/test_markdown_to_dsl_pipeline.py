@@ -852,35 +852,24 @@ forbidden("cannot_retry_paid_order", when=when=And(
         warned_dsl = '''
 workflow("warned_resume")
 
-entity("payment", Record(
-    status=Enum("pending", "success", "failed"),
-    payment_succeeds=Bool,
+entity("order", Record(
+    status=Enum("CREATED", "FAILED"),
 ))
 
+var("order_exists", Bool)
+
 init(
-    Eq(Field("payment", "status"), "pending"),
-    Eq(Field("payment", "payment_succeeds"), False),
+    Eq(Field("order", "status"), "CREATED"),
+    Eq(Var("order_exists"), False),
 )
 
 action(
-    "payment_attempt_succeeds",
+    "process_order",
     requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Field("payment", "payment_succeeds"),
+        Not(Var("order_exists")),
     ],
     changes=[
-        SetField("payment", "status", "success"),
-    ],
-)
-
-action(
-    "payment_attempt_fails",
-    requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Not(Field("payment", "payment_succeeds")),
-    ],
-    changes=[
-        SetField("payment", "status", "failed"),
+        Set("order_exists", True),
     ],
 )
 '''
@@ -904,7 +893,7 @@ action(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertTrue(any(w.startswith("W_EXPLORATION_FROZEN_OUTCOME") for w in result.warnings))
+            self.assertTrue(any(w.startswith("W_EXPLORATION_EXISTENCE_STATE_INCONSISTENCY") for w in result.warnings))
             self.assertTrue(result.underspecified_assumptions)
 
     def test_render_result_surfaces_public_classification_fields(self) -> None:
