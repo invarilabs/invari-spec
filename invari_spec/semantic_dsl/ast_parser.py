@@ -16,6 +16,7 @@ from invari_spec.semantic_dsl.model import (
     EntityDecl,
     EnumType,
     Expr,
+    FairnessKind,
     FieldRef,
     ForbiddenDecl,
     InvariantDecl,
@@ -191,13 +192,31 @@ class _Builder:
             raise self._parse_error(call, "action(...) expects one name argument")
         name = self._string_arg(call.args[0], "action name")
         kwargs = self._kwargs(call)
+        fairness = self._parse_action_fairness(kwargs.pop("fairness", None))
         requires = self._expr_list(kwargs.pop("requires", None), "requires")
         changes = self._update_list(kwargs.pop("changes", None), "changes")
         emits = self._expr_list(kwargs.pop("emits", None), "emits")
         ensures = self._expr_list(kwargs.pop("ensures", None), "ensures")
         if kwargs:
             raise self._parse_error(call, f"unsupported action keyword(s): {', '.join(sorted(kwargs))}")
-        self.actions.append(ActionDecl(name=name, requires=requires, changes=changes, emits=emits, ensures=ensures))
+        self.actions.append(
+            ActionDecl(
+                name=name,
+                requires=requires,
+                changes=changes,
+                emits=emits,
+                ensures=ensures,
+                fairness=fairness,
+            )
+        )
+
+    def _parse_action_fairness(self, node: ast.AST | None) -> FairnessKind | None:
+        if node is None:
+            return None
+        fairness = self._string_arg(node, "action fairness")
+        if fairness not in {"weak", "strong"}:
+            raise self._parse_error(node, 'unsupported action fairness; expected "weak" or "strong"')
+        return fairness
 
     def _parse_invariant(self, call: ast.Call) -> None:
         self._no_keywords(call)

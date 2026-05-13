@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
-from test_semantic_dsl_parser import REVIEW_WORKFLOW
+try:
+    from tests.test_semantic_dsl_parser import REVIEW_WORKFLOW
+except ImportError:
+    from test_semantic_dsl_parser import REVIEW_WORKFLOW
 
 
 def _load_tla_sanity_module():
@@ -51,6 +54,26 @@ class SemanticDslTlaTest(unittest.TestCase):
         self.assertIn("\\/ CompleteReview", tla)
         self.assertIn("Spec ==", tla)
         self.assertIn("Init /\\ [][Next]_vars", tla)
+
+    def test_lowers_action_fairness_into_spec(self) -> None:
+        model = parse_dsl_source(
+            REVIEW_WORKFLOW.replace(
+                'action(\n    "complete_review",',
+                'action(\n    "complete_review",\n    fairness="weak",',
+                1,
+            ).replace(
+                'action(\n    "approve_request",',
+                'action(\n    "approve_request",\n    fairness="strong",',
+                1,
+            )
+        )
+
+        tla = lower_to_tla(model)
+
+        self.assertIn("Spec ==", tla)
+        self.assertIn("Init /\\ [][Next]_vars", tla)
+        self.assertIn("/\\ WF_vars(CompleteReview)", tla)
+        self.assertIn("/\\ SF_vars(ApproveRequest)", tla)
 
     def test_lowers_invariant_to_cfg(self) -> None:
         cfg = build_cfg(self._model())

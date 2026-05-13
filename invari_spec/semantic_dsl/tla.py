@@ -84,7 +84,8 @@ class _Lowerer:
             lines.append("")
 
         lines.extend(self._next())
-        lines.extend(["", "Spec ==", "  Init /\\ [][Next]_vars", ""])
+        spec_clauses = ["Init /\\ [][Next]_vars", *self._fairness_clauses()]
+        lines.extend(["", "Spec ==", *(f"  /\\ {clause}" if idx else f"  {clause}" for idx, clause in enumerate(spec_clauses)), ""])
         lines.extend(self._properties())
         lines.extend(["====", ""])
         return "\n".join(lines)
@@ -256,6 +257,15 @@ class _Lowerer:
             prefix = "\\/" if idx == 0 else "\\/"
             lines.append(f"  {prefix} {_operator_name(action.name)}")
         return lines
+
+    def _fairness_clauses(self) -> list[str]:
+        clauses: list[str] = []
+        for action in self.model.actions:
+            if action.fairness == "weak":
+                clauses.append(f"WF_vars({_operator_name(action.name)})")
+            elif action.fairness == "strong":
+                clauses.append(f"SF_vars({_operator_name(action.name)})")
+        return clauses
 
     def _properties(self) -> list[str]:
         lines: list[str] = []

@@ -22,6 +22,8 @@ class DslGenerationAttempt:
     review_feedback_path: str | None = None
     review_repair_path: str | None = None
     assumptions_path: str | None = None
+    explicit_fairness: list[str] = field(default_factory=list)
+    inferred_fairness: list[str] = field(default_factory=list)
     fix_comments: list[str] = field(default_factory=list)
 
 
@@ -59,6 +61,8 @@ class MarkdownToTlaResult:
     fairness_sensitive: bool
     liveness_classification: Literal["confirmed_failure", "missing_fairness", "not_applicable"]
     notes: list[str]
+    explicit_fairness: list[str] = field(default_factory=list)
+    inferred_fairness: list[str] = field(default_factory=list)
     tlc_exit_code: int | None = None
     trace: str = ""
 

@@ -68,6 +68,20 @@ action(
 '''
 
 
+VALID_DSL_WITH_WEAK_FAIRNESS = VALID_DSL.replace(
+    'action(\n    "finish",',
+    'action(\n    "finish",\n    fairness="weak",',
+    1,
+)
+
+
+VALID_DSL_WITH_STRONG_FAIRNESS = VALID_DSL.replace(
+    'action(\n    "finish",',
+    'action(\n    "finish",\n    fairness="strong",',
+    1,
+)
+
+
 INVALID_DSL = VALID_DSL.replace(
     "    # FIX attempt 2: initialized missing field task.retry_count\n    Eq(Field(\"task\", \"retry_count\"), 0),\n",
     "",
@@ -207,6 +221,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("Begin your response with the ```python fenced block", prompt)
         self.assertIn("Do not include any prose before the first fence", prompt)
         self.assertIn("still return the previous DSL unchanged", prompt)
+        self.assertIn('fairness="weak"', prompt)
+        self.assertIn('fairness="strong"', prompt)
         self.assertIn("```python", prompt)
         self.assertIn("```text", prompt)
         self.assertIn("Formal modeling review feedback:", prompt)
@@ -407,10 +423,279 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.repair_response.txt").exists())
             self.assertEqual(
                 Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8").strip(),
-                "attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",
+                "review attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",
             )
             self.assertIn("/review_attempts/attempt_1.dsl.py", result.attempts[0].review_repair_path or "")
             self.assertIn("/dsl_validation_attempts/attempt_1.dsl.py", result.attempts[0].candidate_path or "")
+
+    def test_review_repair_materializes_inferred_fairness_and_records_provenance(self) -> None:
+        repaired = VALID_DSL_WITH_WEAK_FAIRNESS.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    INVALID_DSL,
+                    "1. Add fairness to the completion action so the notification-style step is modeled as eventual system-owned work.\nQuestions:\nquestion#1: What progress assumption is appropriate for finish?",
+                    f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What progress assumption is appropriate for finish?\nanswer#1: Use weak fairness for finish because it is a system-owned action that should eventually run once enabled.\n```",
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.explicit_fairness, [])
+            self.assertEqual(result.inferred_fairness, ["finish:weak"])
+            self.assertEqual(result.attempts[0].explicit_fairness, [])
+            self.assertEqual(result.attempts[0].inferred_fairness, ["finish:weak"])
+            repair_text = Path(result.attempts[0].review_repair_path or "").read_text(encoding="utf-8")
+            self.assertIn('fairness="weak"', repair_text)
+            assumptions_text = Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8")
+            self.assertIn("assumption#1:", assumptions_text)
+            self.assertIn('finish', assumptions_text)
+            self.assertIn('fairness="weak"', assumptions_text)
+
+    def test_inferred_fairness_persists_into_later_validation_repairs(self) -> None:
+        invalid_with_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        valid_attempt_2 = VALID_DSL_WITH_WEAK_FAIRNESS.replace("# FIX attempt 2:", "# FIX attempt 2:", 1)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    INVALID_DSL,
+                    "1. Add weak fairness to finish because completion is system-owned progress.",
+                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
+                    "No gaps found.",
+                    valid_attempt_2,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.attempt_count, 2)
+            attempt_one_text = Path(result.attempts[0].candidate_path or "").read_text(encoding="utf-8")
+            attempt_two_text = Path(result.attempts[1].candidate_path or "").read_text(encoding="utf-8")
+            self.assertIn('fairness="weak"', attempt_one_text)
+            self.assertIn('fairness="weak"', attempt_two_text)
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            self.assertIn("assumption#1:", assumptions_text)
+            self.assertIn("review attempt #1", assumptions_text)
+            self.assertEqual(result.inferred_fairness, ["finish:weak"])
+
+    def test_validation_fairness_assumptions_use_distinct_attempt_namespace(self) -> None:
+        invalid_with_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        valid_attempt_2 = VALID_DSL_WITH_STRONG_FAIRNESS.replace("# FIX attempt 2:", "# FIX attempt 2:", 1)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    INVALID_DSL,
+                    "1. Add weak fairness to finish because completion is system-owned progress.",
+                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
+                    "No gaps found.",
+                    valid_attempt_2,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            self.assertIn("review attempt #1", assumptions_text)
+            self.assertIn("validation attempt #2", assumptions_text)
+            self.assertNotIn("\nattempt #1\n", assumptions_text)
+            self.assertIn('fairness="strong"', assumptions_text)
+
+    def test_explicit_fairness_changes_are_recorded_in_assumptions(self) -> None:
+        invalid_with_weak_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    invalid_with_weak_fairness,
+                    "No gaps found.",
+                    VALID_DSL_WITH_STRONG_FAIRNESS,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.explicit_fairness, ["finish:strong"])
+            self.assertEqual(result.inferred_fairness, [])
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            self.assertIn("validation attempt #2", assumptions_text)
+            self.assertIn('Changed explicit fairness for action `finish` from fairness="weak" (WF) to fairness="strong" (SF) in the DSL.', assumptions_text)
+
+    def test_explicit_fairness_removal_is_recorded_in_assumptions(self) -> None:
+        invalid_with_weak_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    invalid_with_weak_fairness,
+                    "No gaps found.",
+                    VALID_DSL,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.explicit_fairness, [])
+            self.assertEqual(result.inferred_fairness, [])
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            self.assertIn("validation attempt #2", assumptions_text)
+            self.assertIn('Removed explicit fairness for action `finish` from fairness="weak" (WF) in the DSL.', assumptions_text)
+
+    def test_explicit_fairness_removal_is_not_duplicated_in_later_validation_attempts(self) -> None:
+        invalid_with_weak_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        valid_attempt_3 = VALID_DSL.replace("# FIX attempt 2:", "# FIX attempt 3:", 1)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    invalid_with_weak_fairness,
+                    "No gaps found.",
+                    INVALID_DSL,
+                    valid_attempt_3,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=3,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            removal_message = 'Removed explicit fairness for action `finish` from fairness="weak" (WF) in the DSL.'
+            self.assertEqual(assumptions_text.count(removal_message), 1)
+            self.assertIn("validation attempt #2", assumptions_text)
+            self.assertNotIn("validation attempt #3", assumptions_text)
+
+    def test_inferred_fairness_removal_is_recorded_in_assumptions(self) -> None:
+        invalid_with_fairness = INVALID_DSL.replace(
+            'action(\n    "finish",',
+            'action(\n    "finish",\n    fairness="weak",',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    INVALID_DSL,
+                    "1. Add weak fairness to finish because completion is system-owned progress.",
+                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
+                    "No gaps found.",
+                    VALID_DSL,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=2,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.explicit_fairness, [])
+            self.assertEqual(result.inferred_fairness, [])
+            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
+            self.assertIn("review attempt #1", assumptions_text)
+            self.assertIn("validation attempt #2", assumptions_text)
+            self.assertIn('Removed inferred fairness for action `finish` from fairness="weak" (WF) in the DSL.', assumptions_text)
 
     def test_review_loop_with_no_questions_skips_assumptions_entry(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -645,6 +930,8 @@ action(
             self.assertIn("BUG_CLASSES:", rendered)
             self.assertIn("UNDERSPECIFIED:", rendered)
             self.assertIn("LIVENESS:", rendered)
+            self.assertIn("FAIRNESS_EXPLICIT:", rendered)
+            self.assertIn("FAIRNESS_INFERRED:", rendered)
 
 
 if __name__ == "__main__":

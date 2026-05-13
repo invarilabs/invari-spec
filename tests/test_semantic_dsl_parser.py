@@ -100,9 +100,37 @@ class SemanticDslParserTest(unittest.TestCase):
         self.assertIsInstance(status_type, EnumType)
         self.assertEqual(status_type.values, ("draft", "submitted", "approved", "rejected"))
         self.assertEqual(len(model.actions), 3)
+        self.assertIsNone(model.actions[0].fairness)
         self.assertEqual(len(model.invariants), 1)
         self.assertEqual(len(model.forbiddens), 1)
         self.assertEqual(len(model.obligations), 1)
+
+    def test_accepts_action_local_fairness(self) -> None:
+        source = REVIEW_WORKFLOW.replace(
+            'action(\n    "complete_review",',
+            'action(\n    "complete_review",\n    fairness="weak",',
+            1,
+        ).replace(
+            'action(\n    "approve_request",',
+            'action(\n    "approve_request",\n    fairness="strong",',
+            1,
+        )
+
+        model = parse_dsl_source(source)
+
+        fairness_by_action = {action.name: action.fairness for action in model.actions}
+        self.assertEqual(fairness_by_action["complete_review"], "weak")
+        self.assertEqual(fairness_by_action["approve_request"], "strong")
+
+    def test_rejects_unsupported_action_fairness(self) -> None:
+        source = REVIEW_WORKFLOW.replace(
+            'action(\n    "complete_review",',
+            'action(\n    "complete_review",\n    fairness="eventual",',
+            1,
+        )
+
+        with self.assertRaisesRegex(DslParseError, r'expected "weak" or "strong"'):
+            parse_dsl_source(source)
 
     def test_rejects_arbitrary_python(self) -> None:
         with self.assertRaises(DslParseError):
