@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import ast
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+from itertools import product
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 from typing import Literal, Protocol
 
 try:
@@ -20,7 +23,17 @@ try:
 except Exception:  # noqa: BLE001
     OpenAI = None  # type: ignore[assignment]
 
-from invari_spec.pipeline.result_types import DslGenerationAttempt, Fixture, MarkdownToTlaRequest, MarkdownToTlaResult
+from invari_spec.pipeline.result_types import (
+    AssumptionDecision,
+    DslGenerationAttempt,
+    Fixture,
+    MarkdownToTlaRequest,
+    MarkdownToTlaResult,
+    PipelineTiming,
+    ReviewFinding,
+    ReviewSummary,
+    VariantResult,
+)
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source, tla_lowering_warnings
 from invari_spec.semantic_dsl.errors import DslError
 from invari_spec.semantic_dsl.model import WorkflowModel
@@ -35,7 +48,8 @@ DEFAULT_FIXTURE_ORDER = (
     "infinite_retry",
     "unreachable_success",
 )
-MAX_REVIEW_ATTEMPTS = 10
+MAX_REVIEW_ATTEMPTS = 3
+REVIEW_CAP_NOTE = f"Fidelity review stopped after reaching the cap of {MAX_REVIEW_ATTEMPTS} rounds."
 FIX_COMMENT_RE = re.compile(r"^\s*#\s*FIX attempt \d+:\s*.+$")
 
 DSL_CANONICAL_FORMS = """
@@ -44,7 +58,7 @@ Canonical DSL forms:
 - entity("entity_name", Record(field_name=Type, ...))
 - var("var_name", Type)
 - init(predicate1, predicate2, ...)
-- action("action_name", fairness="weak"|"strong"?, requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
+- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
 - invariant("name", predicate)
 - forbidden("name", when=predicate)
 - obligation("name", trigger=predicate, must_eventually=predicate)
@@ -74,6 +88,23 @@ Canonical update forms:
 - Set("var_name", value)
 - SetField("entity", "field", value)
 """.strip()
+
+
+@contextmanager
+def _timed_stage(timings: list[PipelineTiming] | None, stage: str, detail: str | None = None):
+    if timings is None:
+        yield
+        return
+    started_at = perf_counter()
+    try:
+        yield
+    finally:
+        timings.append(PipelineTiming(stage=stage, seconds=perf_counter() - started_at, detail=detail))
+
+
+def _add_total_timing(timings: list[PipelineTiming], started_at: float) -> list[PipelineTiming]:
+    without_total = [timing for timing in timings if timing.stage != "total"]
+    return without_total + [PipelineTiming(stage="total", seconds=perf_counter() - started_at)]
 
 
 def _build_validation_repair_hints(validation_error: str) -> list[str]:
@@ -287,18 +318,46 @@ def build_initial_markdown_to_dsl_prompt(markdown: str, fixtures: list[Fixture],
     ).strip() + "\n"
 
 
-def build_dsl_fidelity_review_prompt(*, markdown: str, dsl_source: str) -> str:
+def _format_assumption_ledger(decisions: list[AssumptionDecision]) -> str:
+    if not decisions:
+        return "No prior assumptions have been selected."
+    payload = [
+        {
+            "id": decision.id,
+            "finding_id": decision.finding_id,
+            "status": decision.status,
+            "selected_choice": decision.selected_choice,
+            "choices": decision.choices,
+            "evidence": decision.evidence,
+        }
+        for decision in decisions
+    ]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def build_dsl_fidelity_review_prompt(
+    *,
+    markdown: str,
+    dsl_source: str,
+    assumption_ledger: list[AssumptionDecision] | None = None,
+) -> str:
+    ledger = list(assumption_ledger or [])
     return (
         "\n\n".join(
             [
                 "You are a formal modeling reviewer checking whether a generated semantic DSL file faithfully captures a prose workflow spec.",
                 "Apply these lenses in order: (1) outcome correctness, (2) construct appropriateness, (3) invariant scoping, (4) state exhaustiveness, (5) terminal completeness, (6) entity/batch scope.",
-                "If there are no substantive modeling gaps, return exactly: No gaps found.",
-                "If there are gaps, for each gap found, output: Why it matters / What to update / What DSL action to take.",
-                "Format each as a numbered change with sub-bullets.",
-                "If any questions remain, list them at the very end under a heading exactly named: Questions:",
-                "Under Questions:, put one question per line in the form: question#N: <text>",
-                "If no questions remain, omit the Questions: section entirely.",
+                "Return only raw JSON or a fenced ```json block with this exact top-level shape:",
+                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required","choices":["viable interpretation A","viable interpretation B"],"selected_choice":"chosen conservative interpretation when this finding is an underspecified assumption"}]}',
+                "Use severity=blocker only for source-backed fidelity gaps that require automatic DSL repair.",
+                "Use severity=question for open product/modeling questions and severity=suggestion for non-blocking improvements.",
+                "When the source is underspecified, include choices for the viable interpretations and selected_choice for the conservative default. Treat that as an assumption finding unless source text proves the DSL wrong.",
+                "Honor the binding assumption ledger below. Do not reopen a ledger decision as a fresh blocker unless the markdown directly contradicts it; then use kind=assumption and severity=blocker with evidence for the contradiction.",
+                "If there are no substantive modeling gaps, use verdict=no_gaps_found and findings=[].",
+                "If there are only questions or suggestions, use verdict=questions_or_suggestions_only.",
+                "Do not include prose outside the JSON.",
+                "Binding assumption ledger:",
+                _format_assumption_ledger(ledger),
                 "Original spec markdown:",
                 "```markdown",
                 markdown.strip(),
@@ -313,30 +372,33 @@ def build_dsl_fidelity_review_prompt(*, markdown: str, dsl_source: str) -> str:
     )
 
 
-def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, review_feedback: str) -> str:
+def build_dsl_review_repair_prompt(
+    *,
+    markdown: str,
+    previous_output: str,
+    review_feedback: str,
+    assumption_ledger: list[AssumptionDecision] | None = None,
+) -> str:
+    ledger = list(assumption_ledger or [])
     return (
         "\n\n".join(
             [
                 "You are repairing a semantic DSL file based on formal modeling review feedback.",
-                "Apply only the changes needed to address the review feedback while preserving unrelated structure.",
-                "First, apply the numbered review changes as-is to the DSL.",
-                "Next, answer every question in the trailing Questions: section conservatively using the markdown and current DSL.",
-                "If a question cannot be deduced, choose the smallest assumption that preserves spec intent.",
-                "If the repaired workflow needs explicit liveness progress assumptions on an action, materialize them directly on that action using fairness=\"weak\" or fairness=\"strong\".",
-                "Use fairness=\"weak\" by default for system-owned actions that should eventually run once continuously enabled.",
-                "Use fairness=\"strong\" only when the action can be enabled intermittently but still must eventually run if the opportunity recurs.",
-                "Apply any DSL changes implied by those answers as well.",
+                "Apply only the listed severity=blocker findings while preserving unrelated structure.",
+                "Do not repair question-only or suggestion-only findings.",
+                "Do not add assumptions, states, fields, retry policies, actors, or terminal outcomes unless a blocker required_change explicitly requires them.",
+                "Honor the binding assumption ledger. If a blocker can be repaired in more than one way, choose the ledger-selected interpretation.",
                 "Return exactly two fenced blocks and nothing else.",
                 "Begin your response with the ```python fenced block.",
                 "Do not include any prose before the first fence.",
                 "The first fenced block must be ```python and contain only the full corrected DSL file.",
                 "If you cannot improve the DSL, still return the previous DSL unchanged inside the ```python block.",
-                "The second fenced block must be ```text and contain only answered questions in this exact format:",
+                "The second fenced block must be ```text and contain only blocker-linked assumptions in this exact format when needed:",
                 "question#1: ...",
                 "answer#1: ...",
                 "question#2: ...",
                 "answer#2: ...",
-                "If there were no questions to answer, return an empty ```text block.",
+                "If no blocker-linked assumptions are needed, return an empty ```text block.",
                 "Original spec markdown:",
                 "```markdown",
                 markdown.strip(),
@@ -347,6 +409,41 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
                 "```",
                 "Formal modeling review feedback:",
                 review_feedback.strip(),
+                "Binding assumption ledger:",
+                _format_assumption_ledger(ledger),
+            ]
+        ).strip()
+        + "\n"
+    )
+
+
+def build_dsl_variant_prompt(
+    *,
+    markdown: str,
+    previous_output: str,
+    assumption_ledger: list[AssumptionDecision],
+    review_feedback: str | None = None,
+) -> str:
+    return (
+        "\n\n".join(
+            [
+                "You are generating one semantic DSL variant for an underspecified workflow.",
+                "Honor exactly the selected choices in the assumption ledger.",
+                "If formal review feedback is provided, address its severity=blocker findings in the variant.",
+                "Preserve unrelated behavior and do not invent extra product semantics.",
+                "Return only the full semantic DSL source, with no prose.",
+                "Original spec markdown:",
+                "```markdown",
+                markdown.strip(),
+                "```",
+                "Base DSL:",
+                "```python",
+                previous_output.strip(),
+                "```",
+                "Variant assumption ledger:",
+                _format_assumption_ledger(assumption_ledger),
+                "Formal review feedback to address:",
+                review_feedback.strip() if review_feedback else "(none)",
             ]
         ).strip()
         + "\n"
@@ -497,116 +594,207 @@ def _parse_review_repair_response(raw: str) -> tuple[str, list[tuple[str, str]]]
     return normalize_common_dsl_syntax(dsl_block).rstrip() + "\n", pairs
 
 
-def _extract_action_fairness(source: str) -> dict[str, str]:
-    try:
-        module = ast.parse(source)
-    except SyntaxError:
-        return {}
+ALLOWED_REVIEW_VERDICTS = {"no_gaps_found", "blockers_found", "questions_or_suggestions_only"}
+ALLOWED_REVIEW_KINDS = {"fidelity", "assumption", "suggestion"}
+ALLOWED_REVIEW_SEVERITIES = {"blocker", "question", "suggestion"}
+ALLOWED_REVIEW_LENSES = {
+    "outcome_correctness",
+    "construct_appropriateness",
+    "invariant_scoping",
+    "state_exhaustiveness",
+    "terminal_completeness",
+    "entity_batch_scope",
+}
 
-    fairness_by_action: dict[str, str] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
-            continue
-        call = stmt.value
-        if not isinstance(call.func, ast.Name) or call.func.id != "action" or not call.args:
-            continue
-        first_arg = call.args[0]
-        if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
-            continue
-        fairness = None
-        for kw in call.keywords:
-            if kw.arg != "fairness":
-                continue
-            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
-                fairness = kw.value.value
+
+def _extract_review_json_payload(raw: str) -> dict:
+    text = raw.strip()
+    if _review_says_no_gaps(text):
+        return {"verdict": "no_gaps_found", "findings": []}
+    fenced = re.findall(r"```([A-Za-z0-9_-]*)\n(.*?)```", text, flags=re.DOTALL)
+    for lang, body in fenced:
+        if lang.strip().lower() == "json":
+            text = body.strip()
             break
-        if fairness in {"weak", "strong"}:
-            fairness_by_action[first_arg.value] = fairness
-    return fairness_by_action
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"review feedback is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("review feedback JSON must be an object")
+    return payload
 
 
-def _format_fairness_entries(fairness_by_action: dict[str, str]) -> list[str]:
-    return [f"{action}:{kind}" for action, kind in sorted(fairness_by_action.items())]
+def parse_structured_review_feedback(raw: str) -> tuple[str, list[ReviewFinding]]:
+    payload = _extract_review_json_payload(raw)
+    verdict = str(payload.get("verdict", "")).strip()
+    if verdict not in ALLOWED_REVIEW_VERDICTS:
+        raise ValueError(f"unsupported review verdict: {verdict or '<missing>'}")
+    findings_payload = payload.get("findings")
+    if not isinstance(findings_payload, list):
+        raise ValueError("review feedback JSON must include findings as a list")
+    findings: list[ReviewFinding] = []
+    for idx, finding_payload in enumerate(findings_payload, start=1):
+        if not isinstance(finding_payload, dict):
+            raise ValueError(f"finding {idx} must be an object")
+        missing = [
+            key
+            for key in ("id", "kind", "severity", "lens", "evidence")
+            if key not in finding_payload
+        ]
+        if missing:
+            raise ValueError(f"finding {idx} missing required field(s): {', '.join(missing)}")
+        finding_id = str(finding_payload["id"]).strip()
+        kind = str(finding_payload["kind"]).strip()
+        severity = str(finding_payload["severity"]).strip()
+        lens = str(finding_payload["lens"]).strip()
+        evidence = str(finding_payload["evidence"]).strip()
+        required_change = str(finding_payload.get("required_change", "")).strip()
+        choices_payload = finding_payload.get("choices", [])
+        if choices_payload is None:
+            choices_payload = []
+        if not isinstance(choices_payload, list) or not all(isinstance(choice, str) for choice in choices_payload):
+            raise ValueError(f"finding {idx} choices must be a list of strings")
+        choices = [choice.strip() for choice in choices_payload if choice.strip()]
+        selected_choice_payload = finding_payload.get("selected_choice")
+        selected_choice = str(selected_choice_payload).strip() if selected_choice_payload is not None else None
+        if not finding_id:
+            raise ValueError(f"finding {idx} has empty id")
+        if kind in ALLOWED_REVIEW_LENSES:
+            kind = "fidelity"
+        if kind not in ALLOWED_REVIEW_KINDS:
+            raise ValueError(f"finding {idx} has unsupported kind: {kind}")
+        if severity not in ALLOWED_REVIEW_SEVERITIES:
+            raise ValueError(f"finding {idx} has unsupported severity: {severity}")
+        if lens not in ALLOWED_REVIEW_LENSES:
+            raise ValueError(f"finding {idx} has unsupported lens: {lens}")
+        if severity == "blocker" and not required_change:
+            raise ValueError(f"finding {idx} blocker missing required_change")
+        if selected_choice and choices and selected_choice not in choices:
+            choices.append(selected_choice)
+        if choices and not selected_choice:
+            selected_choice = choices[0]
+        findings.append(
+            ReviewFinding(
+                id=finding_id,
+                kind=kind,  # type: ignore[arg-type]
+                severity=severity,  # type: ignore[arg-type]
+                lens=lens,  # type: ignore[arg-type]
+                evidence=evidence,
+                required_change=required_change,
+                choices=choices,
+                selected_choice=selected_choice,
+            )
+        )
+    if verdict == "no_gaps_found" and findings:
+        raise ValueError("no_gaps_found verdict cannot include findings")
+    if verdict == "blockers_found" and not any(finding.severity == "blocker" for finding in findings):
+        raise ValueError("blockers_found verdict requires at least one blocker finding")
+    return verdict, findings
 
 
-def _describe_inferred_fairness(action_name: str, kind: str) -> str:
-    tla_kind = "WF" if kind == "weak" else "SF"
-    return (
-        f'Inferred {tla_kind} fairness for action `{action_name}` and materialized it as fairness="{kind}" in the DSL.'
-    )
-
-
-def _describe_explicit_fairness_change(action_name: str, previous_kind: str, current_kind: str) -> str:
-    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
-    current_tla_kind = "WF" if current_kind == "weak" else "SF"
-    return (
-        f'Changed explicit fairness for action `{action_name}` from '
-        f'fairness="{previous_kind}" ({previous_tla_kind}) to fairness="{current_kind}" ({current_tla_kind}) in the DSL.'
-    )
-
-
-def _describe_explicit_fairness_removal(action_name: str, previous_kind: str) -> str:
-    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
-    return (
-        f'Removed explicit fairness for action `{action_name}` from '
-        f'fairness="{previous_kind}" ({previous_tla_kind}) in the DSL.'
-    )
-
-
-def _describe_inferred_fairness_removal(action_name: str, previous_kind: str) -> str:
-    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
-    return (
-        f'Removed inferred fairness for action `{action_name}` from '
-        f'fairness="{previous_kind}" ({previous_tla_kind}) in the DSL.'
-    )
-
-
-def _update_fairness_provenance(
-    *,
-    initial_explicit_fairness: dict[str, str],
-    previous_source: str,
-    candidate_source: str,
-    inferred_fairness: dict[str, str],
-) -> tuple[dict[str, str], dict[str, str], list[str]]:
-    previous_fairness = _extract_action_fairness(previous_source) if previous_source else {}
-    current_fairness = _extract_action_fairness(candidate_source)
-    previous_inferred = dict(inferred_fairness)
-    updated_inferred: dict[str, str] = {}
-    new_assumptions: list[str] = []
-
-    all_action_names = sorted(set(previous_fairness) | set(current_fairness) | set(previous_inferred) | set(initial_explicit_fairness))
-    for action_name in all_action_names:
-        current_kind = current_fairness.get(action_name)
-        previous_kind = previous_fairness.get(action_name)
-        explicit_kind = initial_explicit_fairness.get(action_name)
-        if explicit_kind is not None:
-            if current_kind != previous_kind:
-                if current_kind is None:
-                    if previous_kind is not None:
-                        new_assumptions.append(_describe_explicit_fairness_removal(action_name, previous_kind))
-                else:
-                    baseline_kind = previous_kind if previous_kind is not None else explicit_kind
-                    if current_kind != baseline_kind:
-                        new_assumptions.append(
-                            _describe_explicit_fairness_change(action_name, baseline_kind, current_kind)
-                        )
-            continue
-        inferred_kind = previous_inferred.get(action_name)
-        if current_kind is None:
-            if inferred_kind is not None:
-                new_assumptions.append(_describe_inferred_fairness_removal(action_name, inferred_kind))
-            continue
-        if current_kind != previous_kind:
-            if inferred_kind is None:
-                new_assumptions.append(_describe_inferred_fairness(action_name, current_kind))
-            elif inferred_kind != current_kind:
-                new_assumptions.append(_describe_inferred_fairness(action_name, current_kind))
-        updated_inferred[action_name] = current_kind
-
-    explicit_current = {
-        action_name: kind for action_name, kind in current_fairness.items() if action_name in initial_explicit_fairness
+def _review_repair_feedback_for_blockers(findings: list[ReviewFinding]) -> str:
+    payload = {
+        "verdict": "blockers_found",
+        "findings": [finding for finding in findings if finding.severity == "blocker"],
     }
-    return explicit_current, updated_inferred, new_assumptions
+    return json.dumps(
+        {
+            "verdict": payload["verdict"],
+            "findings": [finding.__dict__ for finding in payload["findings"]],
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _build_review_summary(
+    *,
+    outcome: str,
+    review_rounds: int,
+    repair_rounds: int,
+    blocker_ids: list[str],
+    assumption_count: int,
+    assumption_decisions: list[AssumptionDecision] | None = None,
+    assumption_ledger_path: str | None = None,
+    repairs_avoided_by_ledger: int = 0,
+    variant_results: list[VariantResult] | None = None,
+    variant_report_path: str | None = None,
+) -> ReviewSummary:
+    variants = list(variant_results or [])
+    selected_variant = next((variant for variant in variants if variant.status == "pass"), None)
+    return ReviewSummary(
+        outcome=outcome,  # type: ignore[arg-type]
+        review_rounds=review_rounds,
+        repair_rounds=repair_rounds,
+        blocker_ids=sorted(dict.fromkeys(blocker_ids)),
+        assumption_count=assumption_count,
+        assumption_decisions=list(assumption_decisions or []),
+        assumption_ledger_path=assumption_ledger_path,
+        repairs_avoided_by_ledger=repairs_avoided_by_ledger,
+        variant_count=len(variants),
+        selected_variant_id=selected_variant.id if selected_variant else None,
+        variant_report_path=variant_report_path,
+        variants=variants,
+    )
+
+
+def _assumption_decisions_from_findings(
+    *,
+    findings: list[ReviewFinding],
+    attempt_no: int,
+    existing: list[AssumptionDecision],
+) -> list[AssumptionDecision]:
+    existing_ids = {decision.finding_id for decision in existing}
+    decisions: list[AssumptionDecision] = []
+    for finding in findings:
+        if finding.id in existing_ids:
+            continue
+        if not finding.choices and not finding.selected_choice:
+            continue
+        selected_choice = finding.selected_choice or finding.choices[0]
+        choices = list(finding.choices or [selected_choice])
+        decisions.append(
+            AssumptionDecision(
+                id=f"A{len(existing) + len(decisions) + 1}",
+                finding_id=finding.id,
+                source_attempt=attempt_no,
+                lens=finding.lens,
+                evidence=finding.evidence,
+                choices=choices,
+                selected_choice=selected_choice,
+            )
+        )
+    return decisions
+
+
+def _enumerate_assumption_variants(
+    *,
+    decisions: list[AssumptionDecision],
+    limit: int,
+) -> list[list[AssumptionDecision]]:
+    if limit < 1:
+        raise ValueError("explore_variant_limit must be at least 1")
+    choice_sets = [decision.choices or [decision.selected_choice] for decision in decisions]
+    variants: list[list[AssumptionDecision]] = []
+    for combination in product(*choice_sets):
+        variant_decisions = [
+            AssumptionDecision(
+                id=decision.id,
+                finding_id=decision.finding_id,
+                source_attempt=decision.source_attempt,
+                lens=decision.lens,
+                evidence=decision.evidence,
+                choices=decision.choices,
+                selected_choice=choice,
+                status=decision.status,
+            )
+            for decision, choice in zip(decisions, combination)
+        ]
+        variants.append(variant_decisions)
+        if len(variants) >= limit:
+            break
+    return variants
 
 
 def normalize_common_dsl_syntax(source: str) -> str:
@@ -694,24 +882,102 @@ def write_review_repair_response_artifact(*, run_dir: Path, attempt_no: int, raw
     return response_path
 
 
-def append_review_assumptions_artifact(
-    *,
-    run_dir: Path,
-    attempt_label: str,
-    qa_pairs: list[tuple[str, str]],
-    assumptions: list[str] | None = None,
-) -> Path:
+def write_review_findings_artifact(*, run_dir: Path, attempt_no: int, verdict: str, findings: list[ReviewFinding]) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    findings_path = attempts_dir / f"attempt_{attempt_no}.findings.json"
+    findings_path.write_text(
+        json.dumps(
+            {
+                "verdict": verdict,
+                "findings": [finding.__dict__ for finding in findings],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return findings_path
+
+
+def write_assumption_ledger_artifact(*, run_dir: Path, decisions: list[AssumptionDecision]) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = attempts_dir / "assumption_ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "mode": "default",
+                "decisions": [decision.__dict__ for decision in decisions],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return ledger_path
+
+
+def write_variant_dsl_artifact(*, run_dir: Path, variant_id: str, candidate_source: str) -> Path:
+    variant_dir = run_dir / "variants" / variant_id
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    variant_path = variant_dir / "candidate.dsl.py"
+    variant_path.write_text(candidate_source, encoding="utf-8")
+    return variant_path
+
+
+def write_variant_report_artifact(*, run_dir: Path, variants: list[VariantResult], truncated: bool) -> Path:
+    variants_dir = run_dir / "variants"
+    variants_dir.mkdir(parents=True, exist_ok=True)
+    report_path = variants_dir / "variant_report.json"
+    selected_variant = next((variant for variant in variants if variant.status == "pass"), None)
+    report_path.write_text(
+        json.dumps(
+            {
+                "mode": "explore",
+                "variant_count": len(variants),
+                "selected_variant_id": selected_variant.id if selected_variant else None,
+                "truncated": truncated,
+                "variants": [
+                    {
+                        **variant.__dict__,
+                        "assumption_decisions": [decision.__dict__ for decision in variant.assumption_decisions],
+                    }
+                    for variant in variants
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def write_review_parse_failure_artifact(*, run_dir: Path, attempt_no: int, raw_response: str, error: str) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    failure_path = attempts_dir / f"attempt_{attempt_no}.parse_failure.json"
+    failure_path.write_text(
+        json.dumps({"error": error, "raw_response": raw_response}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return failure_path
+
+
+def append_review_assumptions_artifact(*, run_dir: Path, attempt_no: int, qa_pairs: list[tuple[str, str]]) -> Path:
     attempts_dir = run_dir / "review_attempts"
     attempts_dir.mkdir(parents=True, exist_ok=True)
     assumptions_path = attempts_dir / "assumptions.txt"
-    if not qa_pairs and not assumptions:
+    if not qa_pairs:
         raise ValueError("cannot append empty review assumptions entry")
-    lines = [attempt_label]
+    lines = [f"attempt #{attempt_no}"]
     for idx, (question, answer) in enumerate(qa_pairs, start=1):
         lines.append(f"question#{idx}: {question}")
         lines.append(f"answer#{idx}: {answer}")
-    for idx, assumption in enumerate(assumptions or [], start=1):
-        lines.append(f"assumption#{idx}: {assumption}")
     with assumptions_path.open("a", encoding="utf-8") as fh:
         if assumptions_path.stat().st_size > 0:
             fh.write("\n")
@@ -783,9 +1049,9 @@ def _build_result(
     tlc_exit_code: int | None,
     trace: str,
     has_liveness: bool,
-    explicit_fairness: list[str] | None = None,
-    inferred_fairness: list[str] | None = None,
+    timings: list[PipelineTiming] | None,
     extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     underspecified = _underspecified_assumptions(warnings)
     fairness_sensitive = status == "fail" and has_liveness
@@ -823,10 +1089,10 @@ def _build_result(
         fairness_sensitive=fairness_sensitive,
         liveness_classification=liveness_classification,
         notes=notes,
-        explicit_fairness=list(explicit_fairness or []),
-        inferred_fairness=list(inferred_fairness or []),
         tlc_exit_code=tlc_exit_code,
         trace=trace,
+        timings=list(timings or []),
+        review_summary=review_summary,
     )
 
 
@@ -852,10 +1118,15 @@ def _error_result(
     trace: str = "",
     warnings: list[str] | None = None,
     has_liveness: bool = False,
-    explicit_fairness: list[str] | None = None,
-    inferred_fairness: list[str] | None = None,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
+    extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     _ = req
+    recorded_timings = list(timings) if timings is not None else None
+    if pipeline_started_at is not None and recorded_timings is not None:
+        recorded_timings = _add_total_timing(recorded_timings, pipeline_started_at)
     fix_comments: list[str] = []
     for attempt in attempts:
         fix_comments.extend(attempt.fix_comments)
@@ -876,9 +1147,9 @@ def _error_result(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
-        explicit_fairness=explicit_fairness,
-        inferred_fairness=inferred_fairness,
-        extra_notes=None,
+        timings=recorded_timings,
+        extra_notes=extra_notes,
+        review_summary=review_summary,
     )
     _write_result(result)
     return result
@@ -892,16 +1163,22 @@ def _finalize_validated_model(
     attempts: list[DslGenerationAttempt],
     model: WorkflowModel,
     final_candidate_path: Path,
-    explicit_fairness: list[str] | None = None,
-    inferred_fairness: list[str] | None = None,
     llm_client: LLMClient | None = None,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
+    extra_notes: list[str] | None = None,
+    review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
+    recorded_timings = list(timings) if timings is not None else None
     final_dsl_path = run_dir / "final.dsl.py"
-    shutil.copyfile(final_candidate_path, final_dsl_path)
+    with _timed_stage(recorded_timings, "file_io", "write final DSL"):
+        shutil.copyfile(final_candidate_path, final_dsl_path)
     has_liveness = bool(model.obligations)
+    result_notes: list[str] = list(extra_notes or [])
 
     try:
-        tla_path, cfg_path = write_tla_artifacts(model, run_dir)
+        with _timed_stage(recorded_timings, "tla_lowering"):
+            tla_path, cfg_path = write_tla_artifacts(model, run_dir)
     except Exception as exc:  # noqa: BLE001
         return _error_result(
             req=req,
@@ -913,8 +1190,10 @@ def _finalize_validated_model(
             validation_error=str(exc),
             dsl_path=final_dsl_path,
             has_liveness=has_liveness,
-            explicit_fairness=explicit_fairness,
-            inferred_fairness=inferred_fairness,
+            timings=recorded_timings,
+            pipeline_started_at=pipeline_started_at,
+            extra_notes=result_notes,
+            review_summary=review_summary,
         )
 
     tlc_output_path = None
@@ -925,7 +1204,6 @@ def _finalize_validated_model(
     summary = "Generated validated DSL, TLA+, and CFG"
     warnings = list(model.warnings)
     warnings.extend(tla_lowering_warnings(model))
-    extra_notes: list[str] = []
     assumptions_summary_path: Path | None = None
     assumptions_summary_error: str | None = None
     summary_thread: threading.Thread | None = None
@@ -936,19 +1214,22 @@ def _finalize_validated_model(
             def _run_assumption_summary() -> None:
                 nonlocal assumptions_summary_path, assumptions_summary_error
                 try:
-                    assumptions_text = assumptions_path.read_text(encoding="utf-8")
+                    with _timed_stage(recorded_timings, "file_io", "read assumptions"):
+                        assumptions_text = assumptions_path.read_text(encoding="utf-8")
                     summary_client = llm_client or DefaultSpecDebuggingLLMClient()
-                    summary_text = (summary_client.generate(
-                        build_assumptions_summary_prompt(assumptions_text=assumptions_text),
-                        model=req.llm_model,
-                        max_tokens=2048,
-                    )).strip()
+                    with _timed_stage(recorded_timings, "assumptions_summary"):
+                        summary_text = (summary_client.generate(
+                            build_assumptions_summary_prompt(assumptions_text=assumptions_text),
+                            model=req.llm_model,
+                            max_tokens=2048,
+                        )).strip()
                     if not summary_text:
                         raise ValueError("LLM returned empty assumptions summary")
-                    assumptions_summary_path = write_assumptions_summary_artifact(
-                        run_dir=run_dir,
-                        summary_text=summary_text,
-                    )
+                    with _timed_stage(recorded_timings, "file_io", "write assumptions summary"):
+                        assumptions_summary_path = write_assumptions_summary_artifact(
+                            run_dir=run_dir,
+                            summary_text=summary_text,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     assumptions_summary_error = str(exc)
 
@@ -956,8 +1237,10 @@ def _finalize_validated_model(
             summary_thread.start()
         tlc_output_path = run_dir / "tlc.out"
         try:
-            tlc_status, tlc_exit_code, tlc_raw, trace = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
-            tlc_output_path.write_text(tlc_raw, encoding="utf-8")
+            with _timed_stage(recorded_timings, "tlc"):
+                tlc_status, tlc_exit_code, tlc_raw, trace = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
+            with _timed_stage(recorded_timings, "file_io", "write TLC output"):
+                tlc_output_path.write_text(tlc_raw, encoding="utf-8")
             status = tlc_status
             summary = "TLC passed" if tlc_status == "pass" else "TLC reported a failure"
         except Exception as exc:  # noqa: BLE001
@@ -965,9 +1248,9 @@ def _finalize_validated_model(
                 summary_thread.join()
             tlc_output_path.write_text(str(exc).rstrip() + "\n", encoding="utf-8")
             if assumptions_summary_path is not None:
-                extra_notes.append(f"Assumptions summary: {assumptions_summary_path}")
+                result_notes.append(f"Assumptions summary: {assumptions_summary_path}")
             elif assumptions_summary_error:
-                extra_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
+                result_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
             return _error_result(
                 req=req,
                 input_path=input_path,
@@ -982,19 +1265,23 @@ def _finalize_validated_model(
                 tlc_output_path=tlc_output_path,
                 warnings=warnings,
                 has_liveness=has_liveness,
-                explicit_fairness=explicit_fairness,
-                inferred_fairness=inferred_fairness,
+                timings=recorded_timings,
+                pipeline_started_at=pipeline_started_at,
+                extra_notes=result_notes,
+                review_summary=review_summary,
             )
         if summary_thread is not None:
             summary_thread.join()
         if assumptions_summary_path is not None:
-            extra_notes.append(f"Assumptions summary: {assumptions_summary_path}")
+            result_notes.append(f"Assumptions summary: {assumptions_summary_path}")
         elif assumptions_summary_error:
-            extra_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
+            result_notes.append(f"Assumptions summary failed: {assumptions_summary_error}")
 
     all_fix_comments: list[str] = []
     for attempt in attempts:
         all_fix_comments.extend(attempt.fix_comments)
+    if pipeline_started_at is not None and recorded_timings is not None:
+        recorded_timings = _add_total_timing(recorded_timings, pipeline_started_at)
     result = _build_result(
         status=status,
         input_path=input_path,
@@ -1012,9 +1299,9 @@ def _finalize_validated_model(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
-        explicit_fairness=explicit_fairness,
-        inferred_fairness=inferred_fairness,
-        extra_notes=extra_notes,
+        timings=recorded_timings,
+        extra_notes=result_notes,
+        review_summary=review_summary,
     )
     _write_result(result)
     return result
@@ -1027,28 +1314,34 @@ def _convert_existing_dsl(
     run_dir: Path,
     dsl_file: Path,
     llm_client: LLMClient | None = None,
+    timings: list[PipelineTiming] | None = None,
+    pipeline_started_at: float | None = None,
 ) -> MarkdownToTlaResult:
+    recorded_timings = list(timings) if timings is not None else None
     if not dsl_file.exists() or not dsl_file.is_file():
         raise FileNotFoundError(f"DSL file not found: {dsl_file}")
 
-    candidate_source = normalize_common_dsl_syntax(dsl_file.read_text(encoding="utf-8"))
-    explicit_fairness_map = _extract_action_fairness(candidate_source)
-    initial_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
-    candidate_path, validation_path = write_validation_attempt_artifacts(
-        run_dir=run_dir,
-        attempt_no=1,
-        candidate_source=candidate_source,
-        validation_error=None,
-    )
+    with _timed_stage(recorded_timings, "file_io", "read DSL file"):
+        candidate_source = normalize_common_dsl_syntax(dsl_file.read_text(encoding="utf-8"))
+    with _timed_stage(recorded_timings, "file_io", "write initial/validation DSL artifacts"):
+        initial_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
+        candidate_path, validation_path = write_validation_attempt_artifacts(
+            run_dir=run_dir,
+            attempt_no=1,
+            candidate_source=candidate_source,
+            validation_error=None,
+        )
     fix_comments = extract_fix_comments(candidate_source)
     attempts: list[DslGenerationAttempt] = []
 
     try:
-        model = validate_dsl_source(candidate_source, str(candidate_path))
+        with _timed_stage(recorded_timings, "dsl_validation", "existing DSL"):
+            model = validate_dsl_source(candidate_source, str(candidate_path))
     except DslError as exc:
         validation_error = str(exc)
         validation_path = run_dir / "dsl_validation_attempts" / "attempt_1.validation.txt"
-        validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+        with _timed_stage(recorded_timings, "file_io", "write validation error"):
+            validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
         attempts.append(
             DslGenerationAttempt(
                 attempt=1,
@@ -1056,8 +1349,6 @@ def _convert_existing_dsl(
                 candidate_path=str(candidate_path),
                 validation_error_path=str(validation_path),
                 validation_error=validation_error,
-                explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                inferred_fairness=[],
                 fix_comments=fix_comments,
             )
         )
@@ -1070,8 +1361,8 @@ def _convert_existing_dsl(
             summary="Existing DSL file failed validation",
             validation_error=validation_error,
             dsl_path=initial_path,
-            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-            inferred_fairness=[],
+            timings=recorded_timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
     attempts.append(
@@ -1081,8 +1372,6 @@ def _convert_existing_dsl(
             candidate_path=str(candidate_path),
             validation_error_path=str(validation_path) if validation_path else None,
             validation_error=None,
-            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-            inferred_fairness=[],
             fix_comments=fix_comments,
         )
     )
@@ -1093,13 +1382,99 @@ def _convert_existing_dsl(
         attempts=attempts,
         model=model,
         final_candidate_path=candidate_path,
-        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-        inferred_fairness=[],
         llm_client=llm_client,
+        timings=recorded_timings,
+        pipeline_started_at=pipeline_started_at,
     )
 
 
+def _generate_explore_variants(
+    *,
+    req: MarkdownToTlaRequest,
+    run_dir: Path,
+    markdown: str,
+    base_dsl_source: str,
+    decisions: list[AssumptionDecision],
+    review_feedback: str,
+    client: LLMClient,
+    timings: list[PipelineTiming] | None,
+) -> tuple[list[VariantResult], Path | None]:
+    if not decisions or req.assumption_mode != "explore":
+        return [], None
+    variant_ledgers = _enumerate_assumption_variants(
+        decisions=decisions,
+        limit=req.explore_variant_limit,
+    )
+    variants: list[VariantResult] = []
+    for index, variant_ledger in enumerate(variant_ledgers, start=1):
+        variant_id = f"variant_{index}"
+        variant_dir = run_dir / "variants" / variant_id
+        try:
+            prompt = build_dsl_variant_prompt(
+                markdown=markdown,
+                previous_output=base_dsl_source,
+                assumption_ledger=variant_ledger,
+                review_feedback=review_feedback,
+            )
+            with _timed_stage(timings, "variant_generation", variant_id):
+                candidate_source = normalize_llm_dsl_output(
+                    client.generate(prompt, model=req.llm_model, max_tokens=16384)
+                )
+            with _timed_stage(timings, "file_io", f"write {variant_id} DSL"):
+                dsl_path = write_variant_dsl_artifact(
+                    run_dir=run_dir,
+                    variant_id=variant_id,
+                    candidate_source=candidate_source,
+                )
+            with _timed_stage(timings, "dsl_validation", variant_id):
+                model = validate_dsl_source(candidate_source, str(dsl_path))
+            with _timed_stage(timings, "tla_lowering", variant_id):
+                tla_path, cfg_path = write_tla_artifacts(model, variant_dir)
+            status: Literal["pass", "fail", "error"] = "pass"
+            tlc_output_path: Path | None = None
+            tlc_exit_code: int | None = None
+            if req.run_tlc:
+                tlc_output_path = variant_dir / "tlc.out"
+                with _timed_stage(timings, "tlc", variant_id):
+                    tlc_status, tlc_exit_code, tlc_raw, _ = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
+                tlc_output_path.write_text(tlc_raw, encoding="utf-8")
+                status = tlc_status
+            variants.append(
+                VariantResult(
+                    id=variant_id,
+                    assumption_decisions=variant_ledger,
+                    status=status,
+                    dsl_path=str(dsl_path),
+                    tla_path=str(tla_path),
+                    cfg_path=str(cfg_path),
+                    tlc_output_path=str(tlc_output_path) if tlc_output_path else None,
+                    tlc_exit_code=tlc_exit_code,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            variants.append(
+                VariantResult(
+                    id=variant_id,
+                    assumption_decisions=variant_ledger,
+                    status="error",
+                    validation_error=str(exc),
+                )
+            )
+    truncated = len(variant_ledgers) == req.explore_variant_limit and any(
+        len(decision.choices) > 1 for decision in decisions
+    )
+    with _timed_stage(timings, "file_io", "write variant report"):
+        report_path = write_variant_report_artifact(
+            run_dir=run_dir,
+            variants=variants,
+            truncated=truncated,
+        )
+    return variants, report_path
+
+
 def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient | None = None) -> MarkdownToTlaResult:
+    pipeline_started_at = perf_counter() if req.collect_timings else None
+    timings: list[PipelineTiming] | None = [] if req.collect_timings else None
     input_path = req.input_path.expanduser().resolve()
     if not input_path.exists() or not input_path.is_file():
         raise FileNotFoundError(f"spec markdown not found: {input_path}")
@@ -1108,8 +1483,9 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
 
     generated_root = _resolve_generated_root(req.generated_root, req.cwd)
     run_dir = generated_root / "invari_spec_check" / _slugify(input_path.stem)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _copy_input(input_path, run_dir)
+    with _timed_stage(timings, "file_io", "prepare run directory and copy input"):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _copy_input(input_path, run_dir)
 
     if req.dsl_file is not None:
         return _convert_existing_dsl(
@@ -1118,10 +1494,14 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             run_dir=run_dir,
             dsl_file=req.dsl_file.expanduser().resolve(),
             llm_client=llm_client,
+            timings=timings,
+            pipeline_started_at=pipeline_started_at,
         )
 
-    markdown = input_path.read_text(encoding="utf-8")
-    fixtures = load_fixtures()
+    with _timed_stage(timings, "file_io", "read markdown"):
+        markdown = input_path.read_text(encoding="utf-8")
+    with _timed_stage(timings, "file_io", "load fixtures"):
+        fixtures = load_fixtures()
     client = llm_client or DefaultSpecDebuggingLLMClient()
 
     attempts: list[DslGenerationAttempt] = []
@@ -1131,15 +1511,39 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     model: WorkflowModel | None = None
     final_candidate_path: Path | None = None
     initial_dsl_path: Path | None = None
-    initial_explicit_fairness: dict[str, str] = {}
-    explicit_fairness_map: dict[str, str] = {}
-    inferred_fairness_map: dict[str, str] = {}
+    review_attempt_no = 0
+    review_capped = False
+    review_outcome = "not_run"
+    review_repair_rounds = 0
+    review_blocker_ids: list[str] = []
+    review_assumption_count = 0
+    review_notes: list[str] = []
+    assumption_decisions: list[AssumptionDecision] = []
+    assumption_ledger_path: Path | None = None
+    repairs_avoided_by_ledger = 0
+    variant_results: list[VariantResult] = []
+    variant_report_path: Path | None = None
 
-    for attempt_no in range(1, req.max_attempts + 1):
+    def current_review_summary() -> ReviewSummary:
+        return _build_review_summary(
+            outcome="capped" if review_capped else review_outcome,
+            review_rounds=review_attempt_no,
+            repair_rounds=review_repair_rounds,
+            blocker_ids=review_blocker_ids,
+            assumption_count=review_assumption_count,
+            assumption_decisions=assumption_decisions,
+            assumption_ledger_path=str(assumption_ledger_path) if assumption_ledger_path else None,
+            repairs_avoided_by_ledger=repairs_avoided_by_ledger,
+            variant_results=variant_results,
+            variant_report_path=str(variant_report_path) if variant_report_path else None,
+        )
+
+    attempt_no = 0
+    while attempt_no < req.max_attempts:
+        attempt_no += 1
         review_feedback_path: Path | None = None
         review_repair_path: Path | None = None
         assumptions_path: Path | None = None
-        fairness_assumptions: list[str] = []
         if attempt_no == 1:
             prompt = build_initial_markdown_to_dsl_prompt(markdown, fixtures, req.prompt_path)
         else:
@@ -1158,16 +1562,19 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             )
 
         try:
-            candidate_source = normalize_llm_dsl_output(client.generate(prompt, model=req.llm_model, max_tokens=16384))
+            stage = "dsl_generation" if attempt_no == 1 else "repair_loop"
+            with _timed_stage(timings, stage, f"attempt {attempt_no}"):
+                candidate_source = normalize_llm_dsl_output(client.generate(prompt, model=req.llm_model, max_tokens=16384))
         except Exception as exc:  # noqa: BLE001
             candidate_source = ""
             validation_error = str(exc)
-            candidate_path, validation_path = write_validation_attempt_artifacts(
-                run_dir=run_dir,
-                attempt_no=attempt_no,
-                candidate_source=candidate_source,
-                validation_error=validation_error,
-            )
+            with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source=candidate_source,
+                    validation_error=validation_error,
+                )
             attempts.append(
                 DslGenerationAttempt(
                     attempt=attempt_no,
@@ -1178,163 +1585,35 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                     review_repair_path=str(review_repair_path) if review_repair_path else None,
                     assumptions_path=str(assumptions_path) if assumptions_path else None,
-                    explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                    inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     fix_comments=[],
                 )
             )
             warning_hints = []
             continue
 
-        if attempt_no > 1:
-            explicit_fairness_map, inferred_fairness_map, fairness_assumptions = _update_fairness_provenance(
-                initial_explicit_fairness=initial_explicit_fairness,
-                previous_source=previous_output,
-                candidate_source=candidate_source,
-                inferred_fairness=inferred_fairness_map,
-            )
-            if fairness_assumptions:
-                assumptions_path = append_review_assumptions_artifact(
-                    run_dir=run_dir,
-                    attempt_label=f"validation attempt #{attempt_no}",
-                    qa_pairs=[],
-                    assumptions=fairness_assumptions,
-                )
-
         if attempt_no == 1:
-            initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
-            initial_explicit_fairness = _extract_action_fairness(candidate_source)
-            explicit_fairness_map = dict(initial_explicit_fairness)
-            previous_output = candidate_source
-            for review_attempt_no in range(1, MAX_REVIEW_ATTEMPTS + 1):
-                review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
-                review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
-                review_feedback_path = write_review_feedback_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    review_feedback=review_feedback or "No review feedback returned.",
-                )
-                if not review_feedback or _review_says_no_gaps(review_feedback):
-                    break
-                review_repair_prompt = build_dsl_review_repair_prompt(
-                    markdown=markdown,
-                    previous_output=candidate_source,
-                    review_feedback=review_feedback,
-                )
-                raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
-                write_review_repair_response_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    raw_response=raw_repair_response,
-                )
-                try:
-                    candidate_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
-                except Exception as exc:  # noqa: BLE001
-                    validation_error = str(exc)
-                    candidate_path, validation_path = write_validation_attempt_artifacts(
-                        run_dir=run_dir,
-                        attempt_no=attempt_no,
-                        candidate_source="",
-                        validation_error=validation_error,
-                    )
-                    attempts.append(
-                        DslGenerationAttempt(
-                            attempt=attempt_no,
-                            status="empty",
-                            candidate_path=str(candidate_path),
-                            validation_error_path=str(validation_path) if validation_path else None,
-                            validation_error=validation_error,
-                            review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
-                            review_repair_path=str(review_repair_path) if review_repair_path else None,
-                            assumptions_path=str(assumptions_path) if assumptions_path else None,
-                            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
-                            fix_comments=[],
-                        )
-                    )
-                    return _error_result(
-                        req=req,
-                        input_path=input_path,
-                        run_dir=run_dir,
-                        attempts=attempts,
-                        phase="dsl_generation",
-                        summary=f"Review repair failed: {exc}",
-                        validation_error=validation_error,
-                        dsl_path=initial_dsl_path,
-                        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
-                    )
-                if _review_has_questions(review_feedback) and not qa_pairs:
-                    validation_error = "review repair response missing question/answer pairs for review questions"
-                    candidate_path, validation_path = write_validation_attempt_artifacts(
-                        run_dir=run_dir,
-                        attempt_no=attempt_no,
-                        candidate_source="",
-                        validation_error=validation_error,
-                    )
-                    attempts.append(
-                        DslGenerationAttempt(
-                            attempt=attempt_no,
-                            status="empty",
-                            candidate_path=str(candidate_path),
-                            validation_error_path=str(validation_path) if validation_path else None,
-                            validation_error=validation_error,
-                            review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
-                            review_repair_path=str(review_repair_path) if review_repair_path else None,
-                            assumptions_path=str(assumptions_path) if assumptions_path else None,
-                            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
-                            fix_comments=[],
-                        )
-                    )
-                    return _error_result(
-                        req=req,
-                        input_path=input_path,
-                        run_dir=run_dir,
-                        attempts=attempts,
-                        phase="dsl_generation",
-                        summary="Review repair failed: missing question answers",
-                        validation_error=validation_error,
-                        dsl_path=initial_dsl_path,
-                        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
-                    )
-                explicit_fairness_map, inferred_fairness_map, fairness_assumptions = _update_fairness_provenance(
-                    initial_explicit_fairness=initial_explicit_fairness,
-                    previous_source=previous_output,
-                    candidate_source=candidate_source,
-                    inferred_fairness=inferred_fairness_map,
-                )
-                review_repair_path = write_review_repair_artifact(
-                    run_dir=run_dir,
-                    attempt_no=review_attempt_no,
-                    candidate_source=candidate_source,
-                )
-                if qa_pairs or fairness_assumptions:
-                    assumptions_path = append_review_assumptions_artifact(
-                        run_dir=run_dir,
-                        attempt_label=f"review attempt #{review_attempt_no}",
-                        qa_pairs=qa_pairs,
-                        assumptions=fairness_assumptions,
-                    )
-                previous_output = candidate_source
+            with _timed_stage(timings, "file_io", "write initial DSL"):
+                initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
 
-        candidate_path, _ = write_validation_attempt_artifacts(
-            run_dir=run_dir,
-            attempt_no=attempt_no,
-            candidate_source=candidate_source,
-            validation_error=None,
-        )
+        with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+            candidate_path, _ = write_validation_attempt_artifacts(
+                run_dir=run_dir,
+                attempt_no=attempt_no,
+                candidate_source=candidate_source,
+                validation_error=None,
+            )
         fix_comments = extract_fix_comments(candidate_source)
 
         try:
             if attempt_no > 1 and not _has_attempt_fix_comment(candidate_source, attempt_no):
                 raise ValueError(f"repair attempt {attempt_no} missing # FIX attempt {attempt_no}: comment")
-            model = validate_dsl_source(candidate_source, str(candidate_path))
+            with _timed_stage(timings, "dsl_validation", f"attempt {attempt_no}"):
+                model = validate_dsl_source(candidate_source, str(candidate_path))
         except (DslError, ValueError) as exc:
             validation_error = str(exc)
             validation_path = run_dir / "dsl_validation_attempts" / f"attempt_{attempt_no}.validation.txt"
-            validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+            with _timed_stage(timings, "file_io", f"write validation error {attempt_no}"):
+                validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
             attempts.append(
                 DslGenerationAttempt(
                     attempt=attempt_no,
@@ -1345,8 +1624,6 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                     review_repair_path=str(review_repair_path) if review_repair_path else None,
                     assumptions_path=str(assumptions_path) if assumptions_path else None,
-                    explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                    inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     fix_comments=fix_comments,
                 )
             )
@@ -1364,14 +1641,284 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                 review_repair_path=str(review_repair_path) if review_repair_path else None,
                 assumptions_path=str(assumptions_path) if assumptions_path else None,
-                explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-                inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                 fix_comments=fix_comments,
             )
         )
         previous_output = candidate_source
         warning_hints = list(model.warnings)
         final_candidate_path = candidate_path
+
+        for review_round_index in range(1, MAX_REVIEW_ATTEMPTS + 1):
+            review_attempt_no += 1
+            active_ledger = assumption_decisions if req.assumption_mode in {"default", "explore"} else []
+            review_prompt = build_dsl_fidelity_review_prompt(
+                markdown=markdown,
+                dsl_source=candidate_source,
+                assumption_ledger=active_ledger,
+            )
+            with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
+                review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
+            with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
+                review_feedback_path = write_review_feedback_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    review_feedback=review_feedback or "No review feedback returned.",
+                )
+            try:
+                verdict, findings = parse_structured_review_feedback(review_feedback)
+                with _timed_stage(timings, "file_io", f"write review findings {review_attempt_no}"):
+                    write_review_findings_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        verdict=verdict,
+                        findings=findings,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                with _timed_stage(timings, "file_io", f"write review parse failure {review_attempt_no}"):
+                    parse_failure_path = write_review_parse_failure_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        raw_response=review_feedback,
+                        error=str(exc),
+                    )
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                review_outcome = "review_parse_failed"
+                review_notes.append(f"Fidelity review parse failed: {parse_failure_path}")
+                break
+            blocker_findings = [finding for finding in findings if finding.severity == "blocker"]
+            review_blocker_ids.extend(finding.id for finding in blocker_findings)
+            review_assumption_count += sum(1 for finding in findings if finding.kind == "assumption")
+            if req.assumption_mode in {"default", "explore"}:
+                new_decisions = _assumption_decisions_from_findings(
+                    findings=findings,
+                    attempt_no=review_attempt_no,
+                    existing=assumption_decisions,
+                )
+                if new_decisions:
+                    assumption_decisions.extend(new_decisions)
+                    with _timed_stage(timings, "file_io", f"write assumption ledger {review_attempt_no}"):
+                        assumption_ledger_path = write_assumption_ledger_artifact(
+                            run_dir=run_dir,
+                            decisions=assumption_decisions,
+                        )
+            if req.assumption_mode == "explore" and assumption_decisions:
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                variant_results, variant_report_path = _generate_explore_variants(
+                    req=req,
+                    run_dir=run_dir,
+                    markdown=markdown,
+                    base_dsl_source=candidate_source,
+                    decisions=assumption_decisions,
+                    review_feedback=review_feedback,
+                    client=client,
+                    timings=timings,
+                )
+                selected_variant = next((variant for variant in variant_results if variant.dsl_path), None)
+                if selected_variant and selected_variant.dsl_path:
+                    selected_path = Path(selected_variant.dsl_path)
+                    selected_source = selected_path.read_text(encoding="utf-8")
+                    try:
+                        model = validate_dsl_source(selected_source, str(selected_path))
+                        candidate_source = selected_source
+                        final_candidate_path = selected_path
+                        previous_output = selected_source
+                        warning_hints = list(model.warnings)
+                    except (DslError, ValueError):
+                        pass
+                review_outcome = "blockers_found" if blocker_findings else (
+                    "no_gaps_found" if verdict == "no_gaps_found" else "questions_or_suggestions_only"
+                )
+                break
+            if not blocker_findings:
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                review_outcome = "no_gaps_found" if verdict == "no_gaps_found" else "questions_or_suggestions_only"
+                if findings:
+                    review_notes.append(f"Fidelity review recorded {len(findings)} non-blocking finding(s); no repair was run.")
+                if active_ledger:
+                    repairs_avoided_by_ledger += 1
+                if req.assumption_mode == "explore" and assumption_decisions:
+                    variant_results, variant_report_path = _generate_explore_variants(
+                        req=req,
+                        run_dir=run_dir,
+                        markdown=markdown,
+                        base_dsl_source=candidate_source,
+                        decisions=assumption_decisions,
+                        review_feedback=review_feedback,
+                        client=client,
+                        timings=timings,
+                    )
+                break
+            review_outcome = "blockers_found"
+            review_repair_prompt = build_dsl_review_repair_prompt(
+                markdown=markdown,
+                previous_output=candidate_source,
+                review_feedback=_review_repair_feedback_for_blockers(blocker_findings),
+                assumption_ledger=assumption_decisions if req.assumption_mode in {"default", "explore"} else [],
+            )
+            with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
+                raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
+            review_repair_rounds += 1
+            with _timed_stage(timings, "file_io", f"write review repair response {review_attempt_no}"):
+                write_review_repair_response_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    raw_response=raw_repair_response,
+                )
+            try:
+                repaired_source, qa_pairs = _parse_review_repair_response(raw_repair_response)
+            except Exception as exc:  # noqa: BLE001
+                validation_error = str(exc)
+                attempt_no += 1
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source="",
+                    validation_error=validation_error,
+                )
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="empty",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path) if validation_path else None,
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=[],
+                    )
+                )
+                return _error_result(
+                    req=req,
+                    input_path=input_path,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    phase="dsl_generation",
+                    summary=f"Review repair failed: {exc}",
+                    validation_error=validation_error,
+                    dsl_path=initial_dsl_path,
+                    timings=timings,
+                    pipeline_started_at=pipeline_started_at,
+                    extra_notes=review_notes,
+                    review_summary=current_review_summary(),
+                )
+            if _review_has_questions(review_feedback) and not qa_pairs:
+                validation_error = "review repair response missing question/answer pairs for review questions"
+                attempt_no += 1
+                candidate_path, validation_path = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source="",
+                    validation_error=validation_error,
+                )
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="empty",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path) if validation_path else None,
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=[],
+                    )
+                )
+                return _error_result(
+                    req=req,
+                    input_path=input_path,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    phase="dsl_generation",
+                    summary="Review repair failed: missing question answers",
+                    validation_error=validation_error,
+                    dsl_path=initial_dsl_path,
+                    timings=timings,
+                    pipeline_started_at=pipeline_started_at,
+                    extra_notes=review_notes,
+                    review_summary=current_review_summary(),
+                )
+            with _timed_stage(timings, "file_io", f"write review repair DSL {review_attempt_no}"):
+                review_repair_path = write_review_repair_artifact(
+                    run_dir=run_dir,
+                    attempt_no=review_attempt_no,
+                    candidate_source=repaired_source,
+                )
+            if qa_pairs:
+                with _timed_stage(timings, "file_io", f"write review assumptions {review_attempt_no}"):
+                    assumptions_path = append_review_assumptions_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        qa_pairs=qa_pairs,
+                    )
+
+            attempt_no += 1
+            with _timed_stage(timings, "file_io", f"write validation attempt {attempt_no}"):
+                candidate_path, _ = write_validation_attempt_artifacts(
+                    run_dir=run_dir,
+                    attempt_no=attempt_no,
+                    candidate_source=repaired_source,
+                    validation_error=None,
+                )
+            fix_comments = extract_fix_comments(repaired_source)
+            try:
+                with _timed_stage(timings, "dsl_validation", f"attempt {attempt_no}"):
+                    model = validate_dsl_source(repaired_source, str(candidate_path))
+            except DslError as exc:
+                validation_error = str(exc)
+                if review_round_index == MAX_REVIEW_ATTEMPTS:
+                    review_capped = True
+                validation_path = run_dir / "dsl_validation_attempts" / f"attempt_{attempt_no}.validation.txt"
+                with _timed_stage(timings, "file_io", f"write validation error {attempt_no}"):
+                    validation_path.write_text(validation_error.rstrip() + "\n", encoding="utf-8")
+                attempts.append(
+                    DslGenerationAttempt(
+                        attempt=attempt_no,
+                        status="invalid",
+                        candidate_path=str(candidate_path),
+                        validation_error_path=str(validation_path),
+                        validation_error=validation_error,
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                        review_repair_path=str(review_repair_path) if review_repair_path else None,
+                        assumptions_path=str(assumptions_path) if assumptions_path else None,
+                        fix_comments=fix_comments,
+                    )
+                )
+                previous_output = repaired_source
+                warning_hints = []
+                model = None
+                final_candidate_path = None
+                break
+            attempts.append(
+                DslGenerationAttempt(
+                    attempt=attempt_no,
+                    status="valid",
+                    candidate_path=str(candidate_path),
+                    validation_error_path=None,
+                    validation_error=None,
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                    review_repair_path=str(review_repair_path) if review_repair_path else None,
+                    assumptions_path=str(assumptions_path) if assumptions_path else None,
+                    fix_comments=fix_comments,
+                )
+            )
+            candidate_source = repaired_source
+            previous_output = candidate_source
+            warning_hints = list(model.warnings)
+            final_candidate_path = candidate_path
+            if review_round_index == MAX_REVIEW_ATTEMPTS:
+                review_capped = True
+        if model is None or final_candidate_path is None:
+            continue
         break
 
     if model is None or final_candidate_path is None:
@@ -1385,8 +1932,10 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             validation_error=validation_error or None,
             dsl_path=initial_dsl_path,
             warnings=warning_hints,
-            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
+            timings=timings,
+            pipeline_started_at=pipeline_started_at,
+            extra_notes=([REVIEW_CAP_NOTE] if review_capped else []) + review_notes,
+            review_summary=current_review_summary(),
         )
 
     return _finalize_validated_model(
@@ -1396,9 +1945,11 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         attempts=attempts,
         model=model,
         final_candidate_path=final_candidate_path,
-        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
-        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
         llm_client=client,
+        timings=timings,
+        pipeline_started_at=pipeline_started_at,
+        extra_notes=([REVIEW_CAP_NOTE] if review_capped else []) + review_notes,
+        review_summary=current_review_summary(),
     )
 
 
@@ -1418,8 +1969,30 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
         f"BUG_CLASSES: {', '.join(payload.get('bug_classes') or ['(none)'])}",
         f"LIVENESS: {payload.get('liveness_classification', 'not_applicable')}",
         f"FAIRNESS_SENSITIVE: {payload.get('fairness_sensitive', False)}",
-        "FIXES:",
+        f"FAIRNESS_EXPLICIT: {', '.join(payload.get('explicit_fairness') or ['(none)'])}",
+        f"FAIRNESS_INFERRED: {', '.join(payload.get('inferred_fairness') or ['(none)'])}",
     ]
+    review_summary = payload.get("review_summary") or {}
+    if review_summary:
+        blocker_ids = review_summary.get("blocker_ids") or []
+        decisions = review_summary.get("assumption_decisions") or []
+        lines.extend(
+            [
+                f"REVIEW_OUTCOME: {review_summary.get('outcome', '')}",
+                f"REVIEW_ROUNDS: {review_summary.get('review_rounds', 0)}",
+                f"REVIEW_REPAIR_ROUNDS: {review_summary.get('repair_rounds', 0)}",
+                f"REVIEW_BLOCKERS: {', '.join(blocker_ids) if blocker_ids else '(none)'}",
+                f"ASSUMPTION_DECISIONS: {len(decisions)}",
+                f"ASSUMPTION_LEDGER: {review_summary.get('assumption_ledger_path') or ''}",
+                f"REPAIRS_AVOIDED_BY_LEDGER: {review_summary.get('repairs_avoided_by_ledger', 0)}",
+                f"VARIANT_COUNT: {review_summary.get('variant_count', 0)}",
+                f"SELECTED_VARIANT: {review_summary.get('selected_variant_id') or ''}",
+                f"VARIANT_REPORT: {review_summary.get('variant_report_path') or ''}",
+            ]
+        )
+        for decision in decisions:
+            lines.append(f"- {decision.get('id')}: {decision.get('selected_choice')}")
+    lines.append("FIXES:")
     fixes = payload.get("fix_comments") or []
     if fixes:
         lines.extend(f"- {fix}" for fix in fixes)
@@ -1435,18 +2008,6 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
     underspecified = payload.get("underspecified_assumptions") or []
     if underspecified:
         lines.extend(f"- {item}" for item in underspecified)
-    else:
-        lines.append("- (none)")
-    lines.append("FAIRNESS_EXPLICIT:")
-    explicit_fairness = payload.get("explicit_fairness") or []
-    if explicit_fairness:
-        lines.extend(f"- {item}" for item in explicit_fairness)
-    else:
-        lines.append("- (none)")
-    lines.append("FAIRNESS_INFERRED:")
-    inferred_fairness = payload.get("inferred_fairness") or []
-    if inferred_fairness:
-        lines.extend(f"- {item}" for item in inferred_fairness)
     else:
         lines.append("- (none)")
     notes = payload.get("notes") or []

@@ -37,3 +37,6 @@ class CliCheckTest(unittest.TestCase):
             self.assertEqual(payload["status"], "pass")
             self.assertIn("bug_classes", payload)
             self.assertIn("underspecified_assumptions", payload)
+            self.assertNotIn("timings", payload)
+            result_json = output_dir / "invari_spec_check" / "SPEC" / "result.json"
+            self.assertNotIn("timings", json.loads(result_json.read_text(encoding="utf-8")))

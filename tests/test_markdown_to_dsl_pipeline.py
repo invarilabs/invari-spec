@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -8,9 +9,11 @@ from unittest.mock import patch
 
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_file
 from invari_spec.pipeline import (
+    AssumptionDecision,
     MarkdownToTlaRequest,
     build_dsl_fidelity_review_prompt,
     build_dsl_review_repair_prompt,
+    build_dsl_variant_prompt,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
     convert_markdown_to_tla,
@@ -19,7 +22,7 @@ from invari_spec.pipeline import (
     normalize_common_dsl_syntax,
     normalize_llm_dsl_output,
 )
-from invari_spec.pipeline.markdown_to_dsl import _find_tla_jar
+from invari_spec.pipeline.markdown_to_dsl import _find_tla_jar, parse_structured_review_feedback
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,20 +71,6 @@ action(
 '''
 
 
-VALID_DSL_WITH_WEAK_FAIRNESS = VALID_DSL.replace(
-    'action(\n    "finish",',
-    'action(\n    "finish",\n    fairness="weak",',
-    1,
-)
-
-
-VALID_DSL_WITH_STRONG_FAIRNESS = VALID_DSL.replace(
-    'action(\n    "finish",',
-    'action(\n    "finish",\n    fairness="strong",',
-    1,
-)
-
-
 INVALID_DSL = VALID_DSL.replace(
     "    # FIX attempt 2: initialized missing field task.retry_count\n    Eq(Field(\"task\", \"retry_count\"), 0),\n",
     "",
@@ -99,6 +88,53 @@ INVALID_DSL_WITH_FIX_COMMENT = INVALID_DSL.replace(
     'init(\n    # FIX attempt 2: tried to repair but task.retry_count is still missing\n',
     1,
 )
+
+
+VALID_DSL_WITH_STATUS_REOPENED = VALID_DSL.replace(
+    'status=Enum("ready", "done")',
+    'status=Enum("ready", "done", "reopened")',
+)
+
+
+INVALID_REVIEW_REPAIR_DSL = VALID_DSL_WITH_STATUS_REOPENED.replace(
+    '    Eq(Field("task", "retry_count"), 0),\n',
+    "",
+)
+
+
+VALID_REPAIR_AFTER_INVALID_REVIEW = INVALID_REVIEW_REPAIR_DSL.replace(
+    "init(\n",
+    'init(\n    # FIX attempt 3: restore missing field task.retry_count after review repair\n    Eq(Field("task", "retry_count"), 0),\n',
+    1,
+)
+
+
+def structured_review(
+    *,
+    severity: str = "blocker",
+    finding_id: str = "missing_retry_count_init",
+    required_change: str = "Initialize task.retry_count.",
+    choices: list[str] | None = None,
+    selected_choice: str | None = None,
+) -> str:
+    finding = {
+        "id": finding_id,
+        "kind": "fidelity" if severity == "blocker" else "suggestion",
+        "severity": severity,
+        "lens": "state_exhaustiveness",
+        "evidence": "The markdown requires a complete task state.",
+        "required_change": required_change if severity == "blocker" else "",
+    }
+    if choices is not None:
+        finding["choices"] = choices
+    if selected_choice is not None:
+        finding["selected_choice"] = selected_choice
+    return json.dumps(
+        {
+            "verdict": "blockers_found" if severity == "blocker" else "questions_or_suggestions_only",
+            "findings": [finding],
+        }
+    )
 
 
 class SpecDebuggingMarkdownToTlaTest(unittest.TestCase):
@@ -205,29 +241,211 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn("outcome correctness", prompt)
         self.assertIn("entity/batch scope", prompt)
         self.assertIn('workflow("x")', prompt)
-        self.assertIn("Questions:", prompt)
-        self.assertIn("question#N:", prompt)
+        self.assertIn('"verdict"', prompt)
+        self.assertIn('"severity":"blocker | question | suggestion"', prompt)
+        self.assertIn("Do not include prose outside the JSON", prompt)
+        self.assertIn("Binding assumption ledger", prompt)
+
+    def test_fidelity_review_prompt_carries_assumption_ledger(self) -> None:
+        prompt = build_dsl_fidelity_review_prompt(
+            markdown="# Spec\n",
+            dsl_source='workflow("x")\ninit()\n',
+            assumption_ledger=[
+                AssumptionDecision(
+                    id="A1",
+                    finding_id="manual_review_gate",
+                    source_attempt=1,
+                    lens="state_exhaustiveness",
+                    evidence="Manual review semantics are underspecified.",
+                    choices=["manual review is separate from approval", "manual review counts as approval"],
+                    selected_choice="manual review is separate from approval",
+                )
+            ],
+        )
+
+        self.assertIn("manual_review_gate", prompt)
+        self.assertIn("manual review is separate from approval", prompt)
+        self.assertIn("Do not reopen a ledger decision as a fresh blocker", prompt)
 
     def test_review_repair_prompt_requires_dsl_only_output(self) -> None:
         prompt = build_dsl_review_repair_prompt(
             markdown="# Spec\n",
             previous_output='workflow("x")\ninit()\n',
-            review_feedback="1. Change something\nQuestions:\nquestion#1: What should x be?",
+            review_feedback=structured_review(required_change="Change x."),
         )
 
-        self.assertIn("First, apply the numbered review changes as-is", prompt)
-        self.assertIn("Next, answer every question", prompt)
+        self.assertIn("Apply only the listed severity=blocker findings", prompt)
+        self.assertIn("Do not repair question-only or suggestion-only findings", prompt)
         self.assertIn("Return exactly two fenced blocks", prompt)
         self.assertIn("Begin your response with the ```python fenced block", prompt)
         self.assertIn("Do not include any prose before the first fence", prompt)
         self.assertIn("still return the previous DSL unchanged", prompt)
-        self.assertIn('fairness="weak"', prompt)
-        self.assertIn('fairness="strong"', prompt)
         self.assertIn("```python", prompt)
         self.assertIn("```text", prompt)
         self.assertIn("Formal modeling review feedback:", prompt)
-        self.assertIn("question#1:", prompt)
-        self.assertIn("answer#1:", prompt)
+        self.assertIn('"required_change": "Change x."', prompt)
+        self.assertIn("Binding assumption ledger", prompt)
+
+    def test_variant_prompt_carries_selected_assumptions(self) -> None:
+        prompt = build_dsl_variant_prompt(
+            markdown="# Spec\n",
+            previous_output='workflow("x")\ninit()\n',
+            assumption_ledger=[
+                AssumptionDecision(
+                    id="A1",
+                    finding_id="manual_review_gate",
+                    source_attempt=1,
+                    lens="state_exhaustiveness",
+                    evidence="Manual review is underspecified.",
+                    choices=["review before validation", "review after validation"],
+                    selected_choice="review before validation",
+                )
+            ],
+        )
+
+        self.assertIn("semantic DSL variant", prompt)
+        self.assertIn("review before validation", prompt)
+        self.assertIn('workflow("x")', prompt)
+
+    def test_assumption_ledger_is_persisted_and_carried_to_next_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: ambiguous manual review\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    structured_review(
+                        finding_id="manual_review_gate",
+                        required_change="Route manual review through the selected gate.",
+                        choices=["manual review is separate from approval", "manual review counts as approval"],
+                        selected_choice="manual review is separate from approval",
+                    ),
+                    f"```python\n{VALID_DSL}```\n```text\n```",
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            ledger_path = root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumption_ledger.json"
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.status, "pass")
+            self.assertTrue(ledger_path.exists())
+            self.assertEqual(ledger_payload["decisions"][0]["finding_id"], "manual_review_gate")
+            self.assertEqual(ledger_payload["decisions"][0]["selected_choice"], "manual review is separate from approval")
+            self.assertIn("manual review is separate from approval", client.prompts[2])
+            self.assertIn("manual review is separate from approval", client.prompts[3])
+            self.assertEqual(len(result.review_summary.assumption_decisions if result.review_summary else []), 1)
+            self.assertEqual(result.review_summary.assumption_ledger_path if result.review_summary else None, str(ledger_path))
+
+    def test_explore_mode_generates_capped_variant_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: ambiguous manual review\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    structured_review(
+                        severity="question",
+                        finding_id="manual_review_gate",
+                        choices=["review before validation", "review after validation"],
+                        selected_choice="review before validation",
+                    ),
+                    VALID_DSL,
+                    VALID_DSL,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                    assumption_mode="explore",
+                    explore_variant_limit=2,
+                ),
+                llm_client=client,
+            )
+
+            report_path = root / "generated" / "invari_spec_check" / "SPEC" / "variants" / "variant_report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.variant_count if result.review_summary else None, 2)
+            self.assertEqual(result.review_summary.selected_variant_id if result.review_summary else None, "variant_1")
+            self.assertTrue(report_path.exists())
+            self.assertEqual(report["variant_count"], 2)
+            self.assertEqual(report["variants"][0]["status"], "pass")
+            self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "variants" / "variant_1" / "candidate.dsl.py").exists())
+
+    def test_review_choice_selected_choice_can_extend_declared_choices(self) -> None:
+        review = structured_review(
+            choices=["path A", "path B"],
+            selected_choice="path C",
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertIn("path C", findings[0].choices)
+        self.assertEqual(findings[0].selected_choice, "path C")
+
+    def test_non_blocking_assumption_finding_may_omit_required_change(self) -> None:
+        review = json.dumps(
+            {
+                "verdict": "questions_or_suggestions_only",
+                "findings": [
+                    {
+                        "id": "manual_review_gate",
+                        "kind": "assumption",
+                        "severity": "question",
+                        "lens": "state_exhaustiveness",
+                        "evidence": "Manual review semantics are underspecified.",
+                        "choices": ["separate approval", "counts as approval"],
+                        "selected_choice": "separate approval",
+                    }
+                ],
+            }
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertEqual(findings[0].required_change, "")
+        self.assertEqual(findings[0].selected_choice, "separate approval")
+
+    def test_lens_value_in_review_kind_is_normalized_to_fidelity(self) -> None:
+        review = json.dumps(
+            {
+                "verdict": "blockers_found",
+                "findings": [
+                    {
+                        "id": "validation_gap",
+                        "kind": "outcome_correctness",
+                        "severity": "blocker",
+                        "lens": "invariant_scoping",
+                        "evidence": "The DSL skips a required validation gate.",
+                        "required_change": "Add the missing validation gate.",
+                    }
+                ],
+            }
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertEqual(findings[0].kind, "fidelity")
 
     def test_review_loop_stops_when_no_gaps_found_is_in_longer_feedback(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -237,8 +455,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    repaired,
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Initialize task.retry_count to 0.\n```",
                     "Review complete. No gaps found. Ready for validation.",
                 ]
@@ -256,9 +474,10 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
+            self.assertEqual(result.attempt_count, 2)
             self.assertEqual(len(client.prompts), 4)
             self.assertEqual(
-                Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(),
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
                 "Review complete. No gaps found. Ready for validation.",
             )
 
@@ -267,7 +486,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", VALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, VALID_DSL, "No gaps found."])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -293,12 +512,13 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertFalse(result.fairness_sensitive)
             self.assertEqual(result.liveness_classification, "not_applicable")
             self.assertEqual(len(client.prompts), 3)
-            self.assertTrue(result.attempts[0].review_feedback_path)
-            self.assertTrue(Path(result.attempts[0].review_feedback_path or "").exists())
-            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[0].review_feedback_path or "")
-            self.assertEqual(Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(), "No gaps found.")
-            self.assertIsNone(result.attempts[0].review_repair_path)
-            self.assertIsNone(result.attempts[0].assumptions_path)
+            self.assertIsNone(result.attempts[0].review_feedback_path)
+            self.assertTrue(result.attempts[1].review_feedback_path)
+            self.assertTrue(Path(result.attempts[1].review_feedback_path or "").exists())
+            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
+            self.assertEqual(Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertIsNone(result.attempts[1].review_repair_path)
+            self.assertIsNone(result.attempts[1].assumptions_path)
 
     def test_repair_attempt_without_fix_comment_is_rejected_before_later_success(self) -> None:
         valid_attempt_3 = VALID_DSL.replace("# FIX attempt 2:", "# FIX attempt 3:")
@@ -306,7 +526,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", VALID_DSL_WITHOUT_FIX_COMMENT, valid_attempt_3])
+            client = FakeLLMClient([INVALID_DSL, VALID_DSL_WITHOUT_FIX_COMMENT, valid_attempt_3, "No gaps found."])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -330,7 +550,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", INVALID_DSL, INVALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, INVALID_DSL])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -358,7 +578,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             root = Path(td)
             skill = root / "SPEC.md"
             skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient([INVALID_DSL, "No gaps found.", INVALID_DSL_WITH_FIX_COMMENT, VALID_DSL])
+            client = FakeLLMClient([INVALID_DSL, INVALID_DSL_WITH_FIX_COMMENT, VALID_DSL])
 
             result = convert_markdown_to_tla(
                 MarkdownToTlaRequest(
@@ -373,12 +593,12 @@ forbidden("cannot_retry_paid_order", when=when=And(
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.attempt_count, 2)
-            self.assertEqual(len(client.prompts), 3)
+            self.assertEqual(len(client.prompts), 2)
             self.assertIn("missing init(...) values for: task.retry_count", result.attempts[0].validation_error or "")
             self.assertIn("missing init(...) values for: task.retry_count", result.attempts[1].validation_error or "")
             self.assertIsNone(result.tla_path)
 
-    def test_review_feedback_loop_can_fix_initial_candidate_before_validation(self) -> None:
+    def test_review_feedback_loop_validates_repaired_candidate_before_finalization(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -386,8 +606,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    repaired,
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                 ]
@@ -405,297 +625,28 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertEqual(result.attempt_count, 1)
+            self.assertEqual(result.attempt_count, 2)
             self.assertEqual(len(client.prompts), 4)
-            self.assertTrue(result.attempts[0].review_feedback_path)
-            self.assertTrue(result.attempts[0].review_repair_path)
-            self.assertTrue(result.attempts[0].assumptions_path)
+            self.assertTrue(result.attempts[1].review_feedback_path)
+            self.assertTrue(result.attempts[1].review_repair_path)
+            self.assertTrue(result.attempts[1].assumptions_path)
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "initial.dsl.py").exists())
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_2.review.txt").exists())
             self.assertEqual(
-                Path(result.attempts[0].review_feedback_path or "").read_text(encoding="utf-8").strip(),
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
                 "No gaps found.",
             )
             self.assertEqual(
-                Path(result.attempts[0].review_repair_path or "").read_text(encoding="utf-8"),
+                Path(result.attempts[1].review_repair_path or "").read_text(encoding="utf-8"),
                 repaired.lstrip("\n"),
             )
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.repair_response.txt").exists())
             self.assertEqual(
-                Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8").strip(),
-                "review attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",
+                Path(result.attempts[1].assumptions_path or "").read_text(encoding="utf-8").strip(),
+                "attempt #1\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.",
             )
-            self.assertIn("/review_attempts/attempt_1.dsl.py", result.attempts[0].review_repair_path or "")
-            self.assertIn("/dsl_validation_attempts/attempt_1.dsl.py", result.attempts[0].candidate_path or "")
-
-    def test_review_repair_materializes_inferred_fairness_and_records_provenance(self) -> None:
-        repaired = VALID_DSL_WITH_WEAK_FAIRNESS.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    INVALID_DSL,
-                    "1. Add fairness to the completion action so the notification-style step is modeled as eventual system-owned work.\nQuestions:\nquestion#1: What progress assumption is appropriate for finish?",
-                    f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What progress assumption is appropriate for finish?\nanswer#1: Use weak fairness for finish because it is a system-owned action that should eventually run once enabled.\n```",
-                    "No gaps found.",
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=1,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            self.assertEqual(result.explicit_fairness, [])
-            self.assertEqual(result.inferred_fairness, ["finish:weak"])
-            self.assertEqual(result.attempts[0].explicit_fairness, [])
-            self.assertEqual(result.attempts[0].inferred_fairness, ["finish:weak"])
-            repair_text = Path(result.attempts[0].review_repair_path or "").read_text(encoding="utf-8")
-            self.assertIn('fairness="weak"', repair_text)
-            assumptions_text = Path(result.attempts[0].assumptions_path or "").read_text(encoding="utf-8")
-            self.assertIn("assumption#1:", assumptions_text)
-            self.assertIn('finish', assumptions_text)
-            self.assertIn('fairness="weak"', assumptions_text)
-
-    def test_inferred_fairness_persists_into_later_validation_repairs(self) -> None:
-        invalid_with_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        valid_attempt_2 = VALID_DSL_WITH_WEAK_FAIRNESS.replace("# FIX attempt 2:", "# FIX attempt 2:", 1)
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    INVALID_DSL,
-                    "1. Add weak fairness to finish because completion is system-owned progress.",
-                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
-                    "No gaps found.",
-                    valid_attempt_2,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=2,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            self.assertEqual(result.attempt_count, 2)
-            attempt_one_text = Path(result.attempts[0].candidate_path or "").read_text(encoding="utf-8")
-            attempt_two_text = Path(result.attempts[1].candidate_path or "").read_text(encoding="utf-8")
-            self.assertIn('fairness="weak"', attempt_one_text)
-            self.assertIn('fairness="weak"', attempt_two_text)
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            self.assertIn("assumption#1:", assumptions_text)
-            self.assertIn("review attempt #1", assumptions_text)
-            self.assertEqual(result.inferred_fairness, ["finish:weak"])
-
-    def test_validation_fairness_assumptions_use_distinct_attempt_namespace(self) -> None:
-        invalid_with_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        valid_attempt_2 = VALID_DSL_WITH_STRONG_FAIRNESS.replace("# FIX attempt 2:", "# FIX attempt 2:", 1)
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    INVALID_DSL,
-                    "1. Add weak fairness to finish because completion is system-owned progress.",
-                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
-                    "No gaps found.",
-                    valid_attempt_2,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=2,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            self.assertIn("review attempt #1", assumptions_text)
-            self.assertIn("validation attempt #2", assumptions_text)
-            self.assertNotIn("\nattempt #1\n", assumptions_text)
-            self.assertIn('fairness="strong"', assumptions_text)
-
-    def test_explicit_fairness_changes_are_recorded_in_assumptions(self) -> None:
-        invalid_with_weak_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    invalid_with_weak_fairness,
-                    "No gaps found.",
-                    VALID_DSL_WITH_STRONG_FAIRNESS,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=2,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            self.assertEqual(result.explicit_fairness, ["finish:strong"])
-            self.assertEqual(result.inferred_fairness, [])
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            self.assertIn("validation attempt #2", assumptions_text)
-            self.assertIn('Changed explicit fairness for action `finish` from fairness="weak" (WF) to fairness="strong" (SF) in the DSL.', assumptions_text)
-
-    def test_explicit_fairness_removal_is_recorded_in_assumptions(self) -> None:
-        invalid_with_weak_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    invalid_with_weak_fairness,
-                    "No gaps found.",
-                    VALID_DSL,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=2,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            self.assertEqual(result.explicit_fairness, [])
-            self.assertEqual(result.inferred_fairness, [])
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            self.assertIn("validation attempt #2", assumptions_text)
-            self.assertIn('Removed explicit fairness for action `finish` from fairness="weak" (WF) in the DSL.', assumptions_text)
-
-    def test_explicit_fairness_removal_is_not_duplicated_in_later_validation_attempts(self) -> None:
-        invalid_with_weak_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        valid_attempt_3 = VALID_DSL.replace("# FIX attempt 2:", "# FIX attempt 3:", 1)
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    invalid_with_weak_fairness,
-                    "No gaps found.",
-                    INVALID_DSL,
-                    valid_attempt_3,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=3,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            removal_message = 'Removed explicit fairness for action `finish` from fairness="weak" (WF) in the DSL.'
-            self.assertEqual(assumptions_text.count(removal_message), 1)
-            self.assertIn("validation attempt #2", assumptions_text)
-            self.assertNotIn("validation attempt #3", assumptions_text)
-
-    def test_inferred_fairness_removal_is_recorded_in_assumptions(self) -> None:
-        invalid_with_fairness = INVALID_DSL.replace(
-            'action(\n    "finish",',
-            'action(\n    "finish",\n    fairness="weak",',
-            1,
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            skill = root / "SPEC.md"
-            skill.write_text("# Spec: repair\n", encoding="utf-8")
-            client = FakeLLMClient(
-                [
-                    INVALID_DSL,
-                    "1. Add weak fairness to finish because completion is system-owned progress.",
-                    f"```python\n{invalid_with_fairness.lstrip()}```\n```text\n```",
-                    "No gaps found.",
-                    VALID_DSL,
-                ]
-            )
-
-            result = convert_markdown_to_tla(
-                MarkdownToTlaRequest(
-                    input_path=skill,
-                    generated_root=root / "generated",
-                    max_attempts=2,
-                    run_tlc=False,
-                    cwd=root,
-                ),
-                llm_client=client,
-            )
-
-            self.assertEqual(result.status, "pass")
-            self.assertEqual(result.explicit_fairness, [])
-            self.assertEqual(result.inferred_fairness, [])
-            assumptions_text = (root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").read_text(encoding="utf-8")
-            self.assertIn("review attempt #1", assumptions_text)
-            self.assertIn("validation attempt #2", assumptions_text)
-            self.assertIn('Removed inferred fairness for action `finish` from fairness="weak" (WF) in the DSL.', assumptions_text)
+            self.assertIn("/review_attempts/attempt_1.dsl.py", result.attempts[1].review_repair_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_2.dsl.py", result.attempts[1].candidate_path or "")
 
     def test_review_loop_with_no_questions_skips_assumptions_entry(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -705,8 +656,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
-                    "1. Missing init for task.retry_count",
+                    repaired,
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\n```",
                     "No gaps found.",
                 ]
@@ -724,8 +675,46 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertIsNone(result.attempts[0].assumptions_path)
+            self.assertIsNone(result.attempts[1].assumptions_path)
             self.assertFalse((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "assumptions.txt").exists())
+
+    def test_review_counter_is_monotonic_after_invalid_review_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    structured_review(finding_id="add_reopened_status", required_change="Add reopened status."),
+                    f"```python\n{INVALID_REVIEW_REPAIR_DSL.lstrip()}```\n```text\n```",
+                    VALID_REPAIR_AFTER_INVALID_REVIEW,
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=3,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            review_dir = root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts"
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.attempt_count, 3)
+            self.assertIn("add_reopened_status", (review_dir / "attempt_1.review.txt").read_text(encoding="utf-8"))
+            self.assertTrue((review_dir / "attempt_1.dsl.py").exists())
+            self.assertEqual((review_dir / "attempt_2.review.txt").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertFalse((review_dir / "attempt_2.dsl.py").exists())
+            self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
+            self.assertIn("/review_attempts/attempt_2.review.txt", result.attempts[2].review_feedback_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_2.dsl.py", result.attempts[1].candidate_path or "")
+            self.assertIn("/dsl_validation_attempts/attempt_3.dsl.py", result.attempts[2].candidate_path or "")
 
     def test_review_repair_missing_dsl_block_fails_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -734,8 +723,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", ""),
+                    structured_review(),
                     "```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Set it to 0.\n```",
                 ]
             )
@@ -755,7 +744,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertEqual(result.phase, "dsl_generation")
             self.assertIn("missing python fenced DSL block", result.validation_error or "")
 
-    def test_review_repair_missing_question_answers_fails_explicitly(self) -> None:
+    def test_malformed_review_feedback_fails_closed_without_repair(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -763,9 +752,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
+                    repaired,
                     "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
-                    f"```python\n{repaired.lstrip()}```\n```text\n```",
                 ]
             )
 
@@ -780,9 +768,11 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 llm_client=client,
             )
 
-            self.assertEqual(result.status, "error")
-            self.assertEqual(result.phase, "dsl_generation")
-            self.assertIn("missing question/answer pairs", result.validation_error or "")
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(len(client.prompts), 2)
+            self.assertIsNone(result.attempts[0].review_repair_path)
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "review_parse_failed")
+            self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.parse_failure.json").exists())
 
     def test_tlc_run_spawns_assumptions_summary_artifact(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -792,8 +782,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             skill.write_text("# Spec: repair\n", encoding="utf-8")
             client = FakeLLMClient(
                 [
-                    INVALID_DSL,
-                    "1. Missing init for task.retry_count\nQuestions:\nquestion#1: What should task.retry_count start at?",
+                    repaired,
+                    structured_review(),
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                     "The model assumes task.retry_count starts at 0, which makes the finish path immediately well-defined.",
@@ -973,6 +963,30 @@ action(
             self.assertIn("LIVENESS:", rendered)
             self.assertIn("FAIRNESS_EXPLICIT:", rendered)
             self.assertIn("FAIRNESS_INFERRED:", rendered)
+
+    def test_render_result_surfaces_review_summary_fields(self) -> None:
+        payload = {
+            "status": "pass",
+            "phase": "complete",
+            "input_path": "SPEC.md",
+            "attempt_count": 1,
+            "bug_classes": [],
+            "review_summary": {
+                "outcome": "questions_or_suggestions_only",
+                "review_rounds": 1,
+                "repair_rounds": 0,
+                "blocker_ids": [],
+                "assumption_count": 0,
+            },
+            "summary": "ok",
+        }
+
+        rendered = render_result(payload, "text")
+
+        self.assertIn("REVIEW_OUTCOME: questions_or_suggestions_only", rendered)
+        self.assertIn("REVIEW_ROUNDS: 1", rendered)
+        self.assertIn("REVIEW_REPAIR_ROUNDS: 0", rendered)
+        self.assertIn("REVIEW_BLOCKERS: (none)", rendered)
 
 
 if __name__ == "__main__":
