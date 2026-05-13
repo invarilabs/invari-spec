@@ -203,13 +203,13 @@ forbidden(
         self.assertIn("PROPERTIES", cfg)
         self.assertIn("SubmittedRequestsEventuallyReviewed", cfg)
 
-    def test_lowers_completion_requires_to_property(self) -> None:
+    def test_lowers_completion_requires_to_invariant(self) -> None:
         model = parse_dsl_source(
             REVIEW_WORKFLOW
             + """
 
 completion_requires(
-    "paid_orders_eventually_ship",
+    "approved_requests_require_rejection",
     outcome=Eq(Field("request", "status"), "approved"),
     condition=Eq(Field("request", "status"), "rejected"),
 )
@@ -218,14 +218,19 @@ completion_requires(
         tla = lower_to_tla(model)
         cfg = build_cfg(model)
 
-        self.assertIn("PaidOrdersEventuallyShip ==", tla)
-        self.assertIn('[]((request.status = "approved") => <>(request.status = "rejected"))', tla)
+        self.assertIn("ApprovedRequestsRequireRejection ==", tla)
+        self.assertIn('(request.status = "approved") => (request.status = "rejected")', tla)
+        completion_block = tla.split("ApprovedRequestsRequireRejection ==", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("<>", completion_block)
         cfg_lines = cfg.splitlines()
-        self.assertIn("PROPERTIES", cfg_lines)
-        self.assertIn("PaidOrdersEventuallyShip", cfg_lines)
+        self.assertIn("ApprovedRequestsRequireRejection", cfg_lines)
         invariants_index = cfg_lines.index("INVARIANTS")
-        properties_index = cfg_lines.index("PROPERTIES")
-        self.assertNotIn("PaidOrdersEventuallyShip", cfg_lines[invariants_index:properties_index])
+        if "PROPERTIES" in cfg_lines:
+            properties_index = cfg_lines.index("PROPERTIES")
+            self.assertIn("ApprovedRequestsRequireRejection", cfg_lines[invariants_index:properties_index])
+            self.assertNotIn("ApprovedRequestsRequireRejection", cfg_lines[properties_index:])
+        else:
+            self.assertIn("ApprovedRequestsRequireRejection", cfg_lines[invariants_index:])
 
     def test_generated_tla_passes_sanity_checker(self) -> None:
         model = self._model()

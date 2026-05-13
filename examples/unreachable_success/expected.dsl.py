@@ -54,8 +54,3 @@ obligation(
     trigger=Field("request", "review_complete"),
     must_eventually=Eq(Field("request", "status"), "succeeded"),
 )
-
-completion_requires(
-    outcome=Field("request", "review_complete"),
-    condition=Eq(Field("request", "status"), "succeeded"),
-)

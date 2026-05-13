@@ -104,6 +104,10 @@ Modeling rules:
 - Put state updates in changes=[...].
 - Model uncertain external outcomes as Bool or Enum state fields and separate guarded actions.
 - Include properties for completion, retries, fallback, invariants, or success reachability when the markdown states them.
+- Use invariant(...) for state predicates that must always hold.
+- Use completion_requires(...) only for same-state completion safety: when outcome is true, condition must already be true in that same state.
+- Use obligation(...) for eventual progress or liveness requirements. Do not encode "eventually succeeds", "eventually ships", or "eventually handles" requirements as completion_requires(...).
+- Use forbidden(...) for explicitly invalid states or transition patterns.
 - If the markdown describes a missing branch or unreachable success, preserve that bug in the DSL instead of inventing the missing action.
 - If behavior is ambiguous, model nondeterminism explicitly rather than assuming constants.
 - Use init(...) only for valid starting states, not to enumerate all workflow states.

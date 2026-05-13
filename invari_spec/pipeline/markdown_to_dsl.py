@@ -122,7 +122,12 @@ def _build_validation_repair_hints(validation_error: str) -> list[str]:
     if "obligation(" in error:
         hints.append('Expected form: obligation("name", trigger=<predicate>, must_eventually=<predicate>)')
     if "completion_requires(" in error:
-        hints.append('Expected form: completion_requires("name"?, outcome=<predicate>, condition=<predicate>)')
+        hints.extend(
+            [
+                'Expected form: completion_requires("name"?, outcome=<predicate>, condition=<predicate>)',
+                "Use completion_requires only for same-state completion safety; use obligation(...) for eventual progress.",
+            ]
+        )
     if "set(" in error or "setfield(" in error:
         hints.extend(
             [

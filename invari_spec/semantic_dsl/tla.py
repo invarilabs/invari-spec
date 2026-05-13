@@ -47,6 +47,7 @@ def build_cfg(model: WorkflowModel) -> str:
     invariant_names = ["TypeOk"]
     invariant_names.extend(_operator_name(inv.name) for inv in model.invariants)
     invariant_names.extend(_operator_name(f.name) for f in model.forbiddens if not lowering.contains_transition_ref(f.predicate))
+    invariant_names.extend(_operator_name(comp.name) for comp in model.completion_requires)
 
     property_names = [_operator_name(obligation.name) for obligation in model.obligations]
     property_names.extend(
@@ -54,7 +55,6 @@ def build_cfg(model: WorkflowModel) -> str:
         for forbidden in model.forbiddens
         if lowering.contains_transition_ref(forbidden.predicate)
     )
-    property_names.extend(_operator_name(comp.name) for comp in model.completion_requires)
     lines = ["SPECIFICATION Spec", "INVARIANTS", *invariant_names]
     if property_names:
         lines.extend(["PROPERTIES", *property_names])
@@ -408,9 +408,9 @@ class _Lowerer:
         for comp in self.model.completion_requires:
             lines.extend(
                 [
-                    "\\* Completion requirements are liveness properties, not same-state invariants.",
+                    "\\* Completion requirements are same-state safety invariants.",
                     f"{_operator_name(comp.name)} ==",
-                    f"  []({self._expr(comp.outcome)} => <>{self._expr(comp.condition)})",
+                    f"  {self._expr(comp.outcome)} => {self._expr(comp.condition)}",
                     "",
                 ]
             )
