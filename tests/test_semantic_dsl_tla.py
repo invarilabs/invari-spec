@@ -247,6 +247,55 @@ completion_requires(
             self.assertIn("Next ==", rewritten)
             self.assertIn("Spec ==", rewritten)
 
+    def test_cfg_enables_deadlock_detection(self) -> None:
+        cfg = build_cfg(self._model())
+
+        self.assertNotIn("CHECK_DEADLOCK", cfg)
+
+    def test_lowers_terminal_states_to_termination_operator(self) -> None:
+        tla = lower_to_tla(self._model())
+
+        self.assertIn("Termination ==", tla)
+        self.assertIn('request.status = "approved" /\\ UNCHANGED vars', tla)
+        self.assertIn('request.status = "rejected" /\\ UNCHANGED vars', tla)
+        self.assertIn("\\/ Termination", tla)
+
+    def test_no_termination_for_cyclic_workflow(self) -> None:
+        model = parse_dsl_source(
+            '''
+workflow("cyclic")
+
+entity("task", Record(
+    status=Enum("active", "paused"),
+))
+
+init(
+    Eq(Field("task", "status"), "active"),
+)
+
+action(
+    "pause",
+    requires=[Eq(Field("task", "status"), "active")],
+    changes=[SetField("task", "status", "paused")],
+)
+
+action(
+    "resume",
+    requires=[Eq(Field("task", "status"), "paused")],
+    changes=[SetField("task", "status", "active")],
+)
+'''
+        )
+        tla = lower_to_tla(model)
+
+        self.assertNotIn("Termination", tla)
+
+    def test_no_termination_for_context_only_enum_fields(self) -> None:
+        tla = lower_to_tla(self._model())
+
+        self.assertNotIn('actor.role = "author"', tla.split("Termination ==")[1] if "Termination ==" in tla else "")
+        self.assertNotIn('actor.role = "manager"', tla.split("Termination ==")[1] if "Termination ==" in tla else "")
+
     def test_warned_models_still_lower(self) -> None:
         model = parse_dsl_source(
             '''
