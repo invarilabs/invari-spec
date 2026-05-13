@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Literal, Union
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ class NamedType:
 
 
 TypeRef = Union[BoolType, IntType, IntRangeType, IntSetType, EnumType, CollectionType, NamedType]
+FairnessKind = Literal["weak", "strong"]
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class ActionDecl:
     changes: tuple[Update, ...]
     emits: tuple[str, ...]
     ensures: tuple[Expr, ...]
+    fairness: FairnessKind | None = None
 
 
 @dataclass(frozen=True)

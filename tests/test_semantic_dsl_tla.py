@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source, tla_lowering_warnings
-from test_semantic_dsl_parser import REVIEW_WORKFLOW
+
+try:
+    from tests.test_semantic_dsl_parser import REVIEW_WORKFLOW
+except ImportError:
+    from test_semantic_dsl_parser import REVIEW_WORKFLOW
 
 
 def _load_tla_sanity_module():
@@ -51,6 +55,26 @@ class SemanticDslTlaTest(unittest.TestCase):
         self.assertIn("\\/ CompleteReview", tla)
         self.assertIn("Spec ==", tla)
         self.assertIn("Init /\\ [][Next]_vars", tla)
+
+    def test_lowers_action_fairness_into_spec(self) -> None:
+        model = parse_dsl_source(
+            REVIEW_WORKFLOW.replace(
+                'action(\n    "complete_review",',
+                'action(\n    "complete_review",\n    fairness="weak",',
+                1,
+            ).replace(
+                'action(\n    "approve_request",',
+                'action(\n    "approve_request",\n    fairness="strong",',
+                1,
+            )
+        )
+
+        tla = lower_to_tla(model)
+
+        self.assertIn("Spec ==", tla)
+        self.assertIn("Init /\\ [][Next]_vars", tla)
+        self.assertIn("/\\ WF_vars(CompleteReview)", tla)
+        self.assertIn("/\\ SF_vars(ApproveRequest)", tla)
 
     def test_lowers_invariant_to_cfg(self) -> None:
         cfg = build_cfg(self._model())
@@ -224,40 +248,78 @@ completion_requires(
             self.assertIn("Next ==", rewritten)
             self.assertIn("Spec ==", rewritten)
 
+    def test_cfg_enables_deadlock_detection(self) -> None:
+        cfg = build_cfg(self._model())
+
+        self.assertNotIn("CHECK_DEADLOCK", cfg)
+
+    def test_lowers_terminal_states_to_termination_operator(self) -> None:
+        tla = lower_to_tla(self._model())
+
+        self.assertIn("Termination ==", tla)
+        self.assertIn('request.status = "approved" /\\ UNCHANGED vars', tla)
+        self.assertIn('request.status = "rejected" /\\ UNCHANGED vars', tla)
+        self.assertIn("\\/ Termination", tla)
+
+    def test_no_termination_for_cyclic_workflow(self) -> None:
+        model = parse_dsl_source(
+            '''
+workflow("cyclic")
+
+entity("task", Record(
+    status=Enum("active", "paused"),
+))
+
+init(
+    Eq(Field("task", "status"), "active"),
+)
+
+action(
+    "pause",
+    requires=[Eq(Field("task", "status"), "active")],
+    changes=[SetField("task", "status", "paused")],
+)
+
+action(
+    "resume",
+    requires=[Eq(Field("task", "status"), "paused")],
+    changes=[SetField("task", "status", "active")],
+)
+'''
+        )
+        tla = lower_to_tla(model)
+
+        self.assertNotIn("Termination", tla)
+
+    def test_no_termination_for_context_only_enum_fields(self) -> None:
+        tla = lower_to_tla(self._model())
+
+        self.assertNotIn('actor.role = "author"', tla.split("Termination ==")[1] if "Termination ==" in tla else "")
+        self.assertNotIn('actor.role = "manager"', tla.split("Termination ==")[1] if "Termination ==" in tla else "")
+
     def test_warned_models_still_lower(self) -> None:
         model = parse_dsl_source(
             '''
 workflow("warned_model")
 
-entity("payment", Record(
-    status=Enum("pending", "success", "failed"),
-    payment_succeeds=Bool,
+entity("order", Record(
+    status=Enum("CREATED", "FAILED"),
 ))
 
+var("order_exists", Bool)
+
 init(
-    Eq(Field("payment", "status"), "pending"),
-    Eq(Field("payment", "payment_succeeds"), False),
+    Eq(Field("order", "status"), "CREATED"),
+    Eq(Var("order_exists"), False),
 )
 
 action(
-    "payment_attempt_succeeds",
+    "process_order",
     requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Field("payment", "payment_succeeds"),
+        Not(Var("order_exists")),
     ],
     changes=[
-        SetField("payment", "status", "success"),
-    ],
-)
-
-action(
-    "payment_attempt_fails",
-    requires=[
-        Eq(Field("payment", "status"), "pending"),
-        Not(Field("payment", "payment_succeeds")),
-    ],
-    changes=[
-        SetField("payment", "status", "failed"),
+        Set("order_exists", True),
     ],
 )
 '''
@@ -266,7 +328,7 @@ action(
         cfg = build_cfg(model)
 
         self.assertTrue(model.warnings)
-        self.assertIn("PaymentAttemptSucceeds ==", tla)
+        self.assertIn("ProcessOrder ==", tla)
         self.assertIn("SPECIFICATION Spec", cfg)
 
     def test_lowers_checked_events_to_bounded_event_state(self) -> None:

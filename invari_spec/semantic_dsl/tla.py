@@ -58,7 +58,7 @@ def build_cfg(model: WorkflowModel) -> str:
     lines = ["SPECIFICATION Spec", "INVARIANTS", *invariant_names]
     if property_names:
         lines.extend(["PROPERTIES", *property_names])
-    lines.extend(["CHECK_DEADLOCK FALSE", ""])
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -114,6 +114,8 @@ class _Lowerer:
         if not self.model.actions:
             raise DslLoweringError("cannot lower DSL model without actions")
 
+        terminal = self._terminal_enum_conditions()
+
         lines: list[str] = [
             f"---- MODULE {self.module_name} ----",
             "EXTENDS Integers, FiniteSets, Sequences, TLC",
@@ -131,8 +133,13 @@ class _Lowerer:
             lines.extend(self._action(action))
             lines.append("")
 
-        lines.extend(self._next())
-        lines.extend(["", "Spec ==", "  Init /\\ [][Next]_vars", ""])
+        if terminal:
+            lines.extend(self._termination_operator(terminal))
+            lines.append("")
+
+        lines.extend(self._next(terminal))
+        spec_clauses = ["Init /\\ [][Next]_vars", *self._fairness_clauses()]
+        lines.extend(["", "Spec ==", *(f"  /\\ {clause}" if idx else f"  {clause}" for idx, clause in enumerate(spec_clauses)), ""])
         lines.extend(self._properties())
         lines.extend(["====", ""])
         return "\n".join(lines)
@@ -322,12 +329,77 @@ class _Lowerer:
         names = list(self.model.entities) + list(self.model.vars)
         return [name for name in names if name not in changed]
 
-    def _next(self) -> list[str]:
+    def _next(self, terminal: list[tuple[str, str, str]] | None = None) -> list[str]:
         lines = ["Next =="]
-        for idx, action in enumerate(self.model.actions):
-            prefix = "\\/" if idx == 0 else "\\/"
-            lines.append(f"  {prefix} {_operator_name(action.name)}")
+        for action in self.model.actions:
+            lines.append(f"  \\/ {_operator_name(action.name)}")
+        if terminal:
+            lines.append("  \\/ Termination")
         return lines
+
+    def _termination_operator(self, terminal: list[tuple[str, str, str]]) -> list[str]:
+        lines = ["Termination =="]
+        for entity_name, field_name, value in terminal:
+            lines.append(f"  \\/ ({entity_name}.{field_name} = {_literal(value)} /\\ UNCHANGED vars)")
+        return lines
+
+    def _terminal_enum_conditions(self) -> list[tuple[str, str, str]]:
+        required_from: set[tuple[str, str, str]] = set()
+        required_fields: set[tuple[str, str]] = set()
+        for action in self.model.actions:
+            for expr in action.requires:
+                self._collect_eq_field_enum(expr, required_from, required_fields)
+
+        changed_fields: set[tuple[str, str]] = set()
+        for action in self.model.actions:
+            for update in action.changes:
+                if isinstance(update, SetFieldUpdate):
+                    entity = self.model.entities.get(update.target.entity)
+                    if entity and isinstance(entity.fields.get(update.target.field), EnumType):
+                        changed_fields.add((update.target.entity, update.target.field))
+
+        progress_fields = required_fields & changed_fields
+        terminal: list[tuple[str, str, str]] = []
+        for entity_name, field_name in sorted(progress_fields):
+            entity = self.model.entities[entity_name]
+            type_ref = entity.fields[field_name]
+            if isinstance(type_ref, EnumType):
+                for value in type_ref.values:
+                    if (entity_name, field_name, value) not in required_from:
+                        terminal.append((entity_name, field_name, value))
+        return terminal
+
+    def _collect_eq_field_enum(
+        self,
+        expr: Expr,
+        out_values: set[tuple[str, str, str]],
+        out_fields: set[tuple[str, str]],
+    ) -> None:
+        if isinstance(expr, CallExpr):
+            if expr.op == "Eq" and len(expr.args) == 2:
+                lhs, rhs = expr.args
+                if (
+                    isinstance(lhs, RefExpr)
+                    and isinstance(lhs.ref, FieldRef)
+                    and isinstance(rhs, LiteralExpr)
+                    and isinstance(rhs.value, str)
+                ):
+                    ref = lhs.ref
+                    entity = self.model.entities.get(ref.entity)
+                    if entity and isinstance(entity.fields.get(ref.field), EnumType):
+                        out_fields.add((ref.entity, ref.field))
+                        out_values.add((ref.entity, ref.field, rhs.value))
+            for arg in expr.args:
+                self._collect_eq_field_enum(arg, out_values, out_fields)
+
+    def _fairness_clauses(self) -> list[str]:
+        clauses: list[str] = []
+        for action in self.model.actions:
+            if action.fairness == "weak":
+                clauses.append(f"WF_vars({_operator_name(action.name)})")
+            elif action.fairness == "strong":
+                clauses.append(f"SF_vars({_operator_name(action.name)})")
+        return clauses
 
     def _properties(self) -> list[str]:
         lines: list[str] = []

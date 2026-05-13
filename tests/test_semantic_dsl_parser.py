@@ -100,9 +100,37 @@ class SemanticDslParserTest(unittest.TestCase):
         self.assertIsInstance(status_type, EnumType)
         self.assertEqual(status_type.values, ("draft", "submitted", "approved", "rejected"))
         self.assertEqual(len(model.actions), 3)
+        self.assertIsNone(model.actions[0].fairness)
         self.assertEqual(len(model.invariants), 1)
         self.assertEqual(len(model.forbiddens), 1)
         self.assertEqual(len(model.obligations), 1)
+
+    def test_accepts_action_local_fairness(self) -> None:
+        source = REVIEW_WORKFLOW.replace(
+            'action(\n    "complete_review",',
+            'action(\n    "complete_review",\n    fairness="weak",',
+            1,
+        ).replace(
+            'action(\n    "approve_request",',
+            'action(\n    "approve_request",\n    fairness="strong",',
+            1,
+        )
+
+        model = parse_dsl_source(source)
+
+        fairness_by_action = {action.name: action.fairness for action in model.actions}
+        self.assertEqual(fairness_by_action["complete_review"], "weak")
+        self.assertEqual(fairness_by_action["approve_request"], "strong")
+
+    def test_rejects_unsupported_action_fairness(self) -> None:
+        source = REVIEW_WORKFLOW.replace(
+            'action(\n    "complete_review",',
+            'action(\n    "complete_review",\n    fairness="eventual",',
+            1,
+        )
+
+        with self.assertRaisesRegex(DslParseError, r'expected "weak" or "strong"'):
+            parse_dsl_source(source)
 
     def test_rejects_arbitrary_python(self) -> None:
         with self.assertRaises(DslParseError):
@@ -149,7 +177,7 @@ class SemanticDslParserTest(unittest.TestCase):
         with self.assertRaisesRegex(DslTypeError, r"Changed\(\.\.\.\) expects Var\(\.\.\.\) or Field\(\.\.\.\)"):
             parse_dsl_source(source)
 
-    def test_warns_on_frozen_outcome_variables(self) -> None:
+    def test_rejects_frozen_bool_external_outcome_fields(self) -> None:
         source = '''
 workflow("frozen_outcome")
 
@@ -185,9 +213,86 @@ action(
     ],
 )
 '''
+        with self.assertRaisesRegex(DslTypeError, "payment.payment_succeeds"):
+            parse_dsl_source(source)
+
+    def test_accepts_anyof_bool_for_external_outcome_fields(self) -> None:
+        source = '''
+workflow("frozen_outcome")
+
+entity("payment", Record(
+    status=Enum("pending", "success", "failed"),
+    payment_succeeds=Bool,
+))
+
+init(
+    Eq(Field("payment", "status"), "pending"),
+    Eq(Field("payment", "payment_succeeds"), AnyOf(Bool)),
+)
+
+action(
+    "payment_attempt_succeeds",
+    requires=[
+        Eq(Field("payment", "status"), "pending"),
+        Field("payment", "payment_succeeds"),
+    ],
+    changes=[
+        SetField("payment", "status", "success"),
+    ],
+)
+
+action(
+    "payment_attempt_fails",
+    requires=[
+        Eq(Field("payment", "status"), "pending"),
+        Not(Field("payment", "payment_succeeds")),
+    ],
+    changes=[
+        SetField("payment", "status", "failed"),
+    ],
+)
+'''
         model = parse_dsl_source(source)
-        self.assertTrue(any(w.startswith("W_EXPLORATION_FROZEN_OUTCOME: payment.payment_succeeds") for w in model.warnings))
-        self.assertTrue(any(w.startswith("W_EXPLORATION_DEAD_BRANCH: payment.payment_succeeds") for w in model.warnings))
+        self.assertFalse(any("payment.payment_succeeds" in w for w in model.warnings))
+
+    def test_rejects_external_outcome_fields_with_new_patterns(self) -> None:
+        source = '''
+workflow("doc_check")
+
+entity("document", Record(
+    status=Enum("draft", "approved", "rejected"),
+    policy_violation=Bool,
+))
+
+init(
+    Eq(Field("document", "status"), "draft"),
+    Eq(Field("document", "policy_violation"), False),
+)
+
+action(
+    "approve_clean_document",
+    requires=[
+        Eq(Field("document", "status"), "draft"),
+        Not(Field("document", "policy_violation")),
+    ],
+    changes=[
+        SetField("document", "status", "approved"),
+    ],
+)
+
+action(
+    "reject_violating_document",
+    requires=[
+        Eq(Field("document", "status"), "draft"),
+        Field("document", "policy_violation"),
+    ],
+    changes=[
+        SetField("document", "status", "rejected"),
+    ],
+)
+'''
+        with self.assertRaisesRegex(DslTypeError, "document.policy_violation"):
+            parse_dsl_source(source)
 
     def test_warns_on_read_before_create(self) -> None:
         source = '''

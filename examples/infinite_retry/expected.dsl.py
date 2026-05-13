@@ -9,7 +9,7 @@ entity("task", Record(
 init(
     Eq(Field("task", "status"), "ready"),
     Eq(Field("task", "retry_count"), 0),
-    Eq(Field("task", "attempt_succeeds"), False),
+    Eq(Field("task", "attempt_succeeds"), AnyOf(Bool)),
 )
 
 action(

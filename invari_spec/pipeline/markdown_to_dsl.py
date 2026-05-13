@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -43,7 +44,7 @@ Canonical DSL forms:
 - entity("entity_name", Record(field_name=Type, ...))
 - var("var_name", Type)
 - init(predicate1, predicate2, ...)
-- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=["event_name", ...], ensures=[predicate, ...])
+- action("action_name", fairness="weak"|"strong"?, requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
 - invariant("name", predicate)
 - forbidden("name", when=predicate)
 - obligation("name", trigger=predicate, must_eventually=predicate)
@@ -321,6 +322,9 @@ def build_dsl_review_repair_prompt(*, markdown: str, previous_output: str, revie
                 "First, apply the numbered review changes as-is to the DSL.",
                 "Next, answer every question in the trailing Questions: section conservatively using the markdown and current DSL.",
                 "If a question cannot be deduced, choose the smallest assumption that preserves spec intent.",
+                "If the repaired workflow needs explicit liveness progress assumptions on an action, materialize them directly on that action using fairness=\"weak\" or fairness=\"strong\".",
+                "Use fairness=\"weak\" by default for system-owned actions that should eventually run once continuously enabled.",
+                "Use fairness=\"strong\" only when the action can be enabled intermittently but still must eventually run if the opportunity recurs.",
                 "Apply any DSL changes implied by those answers as well.",
                 "Return exactly two fenced blocks and nothing else.",
                 "Begin your response with the ```python fenced block.",
@@ -493,6 +497,118 @@ def _parse_review_repair_response(raw: str) -> tuple[str, list[tuple[str, str]]]
     return normalize_common_dsl_syntax(dsl_block).rstrip() + "\n", pairs
 
 
+def _extract_action_fairness(source: str) -> dict[str, str]:
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    fairness_by_action: dict[str, str] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+            continue
+        call = stmt.value
+        if not isinstance(call.func, ast.Name) or call.func.id != "action" or not call.args:
+            continue
+        first_arg = call.args[0]
+        if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
+            continue
+        fairness = None
+        for kw in call.keywords:
+            if kw.arg != "fairness":
+                continue
+            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                fairness = kw.value.value
+            break
+        if fairness in {"weak", "strong"}:
+            fairness_by_action[first_arg.value] = fairness
+    return fairness_by_action
+
+
+def _format_fairness_entries(fairness_by_action: dict[str, str]) -> list[str]:
+    return [f"{action}:{kind}" for action, kind in sorted(fairness_by_action.items())]
+
+
+def _describe_inferred_fairness(action_name: str, kind: str) -> str:
+    tla_kind = "WF" if kind == "weak" else "SF"
+    return (
+        f'Inferred {tla_kind} fairness for action `{action_name}` and materialized it as fairness="{kind}" in the DSL.'
+    )
+
+
+def _describe_explicit_fairness_change(action_name: str, previous_kind: str, current_kind: str) -> str:
+    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
+    current_tla_kind = "WF" if current_kind == "weak" else "SF"
+    return (
+        f'Changed explicit fairness for action `{action_name}` from '
+        f'fairness="{previous_kind}" ({previous_tla_kind}) to fairness="{current_kind}" ({current_tla_kind}) in the DSL.'
+    )
+
+
+def _describe_explicit_fairness_removal(action_name: str, previous_kind: str) -> str:
+    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
+    return (
+        f'Removed explicit fairness for action `{action_name}` from '
+        f'fairness="{previous_kind}" ({previous_tla_kind}) in the DSL.'
+    )
+
+
+def _describe_inferred_fairness_removal(action_name: str, previous_kind: str) -> str:
+    previous_tla_kind = "WF" if previous_kind == "weak" else "SF"
+    return (
+        f'Removed inferred fairness for action `{action_name}` from '
+        f'fairness="{previous_kind}" ({previous_tla_kind}) in the DSL.'
+    )
+
+
+def _update_fairness_provenance(
+    *,
+    initial_explicit_fairness: dict[str, str],
+    previous_source: str,
+    candidate_source: str,
+    inferred_fairness: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    previous_fairness = _extract_action_fairness(previous_source) if previous_source else {}
+    current_fairness = _extract_action_fairness(candidate_source)
+    previous_inferred = dict(inferred_fairness)
+    updated_inferred: dict[str, str] = {}
+    new_assumptions: list[str] = []
+
+    all_action_names = sorted(set(previous_fairness) | set(current_fairness) | set(previous_inferred) | set(initial_explicit_fairness))
+    for action_name in all_action_names:
+        current_kind = current_fairness.get(action_name)
+        previous_kind = previous_fairness.get(action_name)
+        explicit_kind = initial_explicit_fairness.get(action_name)
+        if explicit_kind is not None:
+            if current_kind != previous_kind:
+                if current_kind is None:
+                    if previous_kind is not None:
+                        new_assumptions.append(_describe_explicit_fairness_removal(action_name, previous_kind))
+                else:
+                    baseline_kind = previous_kind if previous_kind is not None else explicit_kind
+                    if current_kind != baseline_kind:
+                        new_assumptions.append(
+                            _describe_explicit_fairness_change(action_name, baseline_kind, current_kind)
+                        )
+            continue
+        inferred_kind = previous_inferred.get(action_name)
+        if current_kind is None:
+            if inferred_kind is not None:
+                new_assumptions.append(_describe_inferred_fairness_removal(action_name, inferred_kind))
+            continue
+        if current_kind != previous_kind:
+            if inferred_kind is None:
+                new_assumptions.append(_describe_inferred_fairness(action_name, current_kind))
+            elif inferred_kind != current_kind:
+                new_assumptions.append(_describe_inferred_fairness(action_name, current_kind))
+        updated_inferred[action_name] = current_kind
+
+    explicit_current = {
+        action_name: kind for action_name, kind in current_fairness.items() if action_name in initial_explicit_fairness
+    }
+    return explicit_current, updated_inferred, new_assumptions
+
+
 def normalize_common_dsl_syntax(source: str) -> str:
     source = re.sub(r'Set\(\s*Var\(\s*"([^"]+)"\s*\)\s*,', r'Set("\1",', source)
     source = re.sub(r'Eq\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,', r'Eq(Var("\1"),', source)
@@ -578,16 +694,24 @@ def write_review_repair_response_artifact(*, run_dir: Path, attempt_no: int, raw
     return response_path
 
 
-def append_review_assumptions_artifact(*, run_dir: Path, attempt_no: int, qa_pairs: list[tuple[str, str]]) -> Path:
+def append_review_assumptions_artifact(
+    *,
+    run_dir: Path,
+    attempt_label: str,
+    qa_pairs: list[tuple[str, str]],
+    assumptions: list[str] | None = None,
+) -> Path:
     attempts_dir = run_dir / "review_attempts"
     attempts_dir.mkdir(parents=True, exist_ok=True)
     assumptions_path = attempts_dir / "assumptions.txt"
-    if not qa_pairs:
+    if not qa_pairs and not assumptions:
         raise ValueError("cannot append empty review assumptions entry")
-    lines = [f"attempt #{attempt_no}"]
+    lines = [attempt_label]
     for idx, (question, answer) in enumerate(qa_pairs, start=1):
         lines.append(f"question#{idx}: {question}")
         lines.append(f"answer#{idx}: {answer}")
+    for idx, assumption in enumerate(assumptions or [], start=1):
+        lines.append(f"assumption#{idx}: {assumption}")
     with assumptions_path.open("a", encoding="utf-8") as fh:
         if assumptions_path.stat().st_size > 0:
             fh.write("\n")
@@ -659,6 +783,8 @@ def _build_result(
     tlc_exit_code: int | None,
     trace: str,
     has_liveness: bool,
+    explicit_fairness: list[str] | None = None,
+    inferred_fairness: list[str] | None = None,
     extra_notes: list[str] | None = None,
 ) -> MarkdownToTlaResult:
     underspecified = _underspecified_assumptions(warnings)
@@ -697,6 +823,8 @@ def _build_result(
         fairness_sensitive=fairness_sensitive,
         liveness_classification=liveness_classification,
         notes=notes,
+        explicit_fairness=list(explicit_fairness or []),
+        inferred_fairness=list(inferred_fairness or []),
         tlc_exit_code=tlc_exit_code,
         trace=trace,
     )
@@ -724,6 +852,8 @@ def _error_result(
     trace: str = "",
     warnings: list[str] | None = None,
     has_liveness: bool = False,
+    explicit_fairness: list[str] | None = None,
+    inferred_fairness: list[str] | None = None,
 ) -> MarkdownToTlaResult:
     _ = req
     fix_comments: list[str] = []
@@ -746,6 +876,8 @@ def _error_result(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        explicit_fairness=explicit_fairness,
+        inferred_fairness=inferred_fairness,
         extra_notes=None,
     )
     _write_result(result)
@@ -760,6 +892,8 @@ def _finalize_validated_model(
     attempts: list[DslGenerationAttempt],
     model: WorkflowModel,
     final_candidate_path: Path,
+    explicit_fairness: list[str] | None = None,
+    inferred_fairness: list[str] | None = None,
     llm_client: LLMClient | None = None,
 ) -> MarkdownToTlaResult:
     final_dsl_path = run_dir / "final.dsl.py"
@@ -779,6 +913,8 @@ def _finalize_validated_model(
             validation_error=str(exc),
             dsl_path=final_dsl_path,
             has_liveness=has_liveness,
+            explicit_fairness=explicit_fairness,
+            inferred_fairness=inferred_fairness,
         )
 
     tlc_output_path = None
@@ -846,6 +982,8 @@ def _finalize_validated_model(
                 tlc_output_path=tlc_output_path,
                 warnings=warnings,
                 has_liveness=has_liveness,
+                explicit_fairness=explicit_fairness,
+                inferred_fairness=inferred_fairness,
             )
         if summary_thread is not None:
             summary_thread.join()
@@ -874,6 +1012,8 @@ def _finalize_validated_model(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        explicit_fairness=explicit_fairness,
+        inferred_fairness=inferred_fairness,
         extra_notes=extra_notes,
     )
     _write_result(result)
@@ -892,6 +1032,7 @@ def _convert_existing_dsl(
         raise FileNotFoundError(f"DSL file not found: {dsl_file}")
 
     candidate_source = normalize_common_dsl_syntax(dsl_file.read_text(encoding="utf-8"))
+    explicit_fairness_map = _extract_action_fairness(candidate_source)
     initial_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
     candidate_path, validation_path = write_validation_attempt_artifacts(
         run_dir=run_dir,
@@ -915,6 +1056,8 @@ def _convert_existing_dsl(
                 candidate_path=str(candidate_path),
                 validation_error_path=str(validation_path),
                 validation_error=validation_error,
+                explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                inferred_fairness=[],
                 fix_comments=fix_comments,
             )
         )
@@ -927,6 +1070,8 @@ def _convert_existing_dsl(
             summary="Existing DSL file failed validation",
             validation_error=validation_error,
             dsl_path=initial_path,
+            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+            inferred_fairness=[],
         )
 
     attempts.append(
@@ -936,6 +1081,8 @@ def _convert_existing_dsl(
             candidate_path=str(candidate_path),
             validation_error_path=str(validation_path) if validation_path else None,
             validation_error=None,
+            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+            inferred_fairness=[],
             fix_comments=fix_comments,
         )
     )
@@ -946,6 +1093,8 @@ def _convert_existing_dsl(
         attempts=attempts,
         model=model,
         final_candidate_path=candidate_path,
+        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+        inferred_fairness=[],
         llm_client=llm_client,
     )
 
@@ -982,11 +1131,15 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     model: WorkflowModel | None = None
     final_candidate_path: Path | None = None
     initial_dsl_path: Path | None = None
+    initial_explicit_fairness: dict[str, str] = {}
+    explicit_fairness_map: dict[str, str] = {}
+    inferred_fairness_map: dict[str, str] = {}
 
     for attempt_no in range(1, req.max_attempts + 1):
         review_feedback_path: Path | None = None
         review_repair_path: Path | None = None
         assumptions_path: Path | None = None
+        fairness_assumptions: list[str] = []
         if attempt_no == 1:
             prompt = build_initial_markdown_to_dsl_prompt(markdown, fixtures, req.prompt_path)
         else:
@@ -1025,14 +1178,34 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                     review_repair_path=str(review_repair_path) if review_repair_path else None,
                     assumptions_path=str(assumptions_path) if assumptions_path else None,
+                    explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                    inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     fix_comments=[],
                 )
             )
             warning_hints = []
             continue
 
+        if attempt_no > 1:
+            explicit_fairness_map, inferred_fairness_map, fairness_assumptions = _update_fairness_provenance(
+                initial_explicit_fairness=initial_explicit_fairness,
+                previous_source=previous_output,
+                candidate_source=candidate_source,
+                inferred_fairness=inferred_fairness_map,
+            )
+            if fairness_assumptions:
+                assumptions_path = append_review_assumptions_artifact(
+                    run_dir=run_dir,
+                    attempt_label=f"validation attempt #{attempt_no}",
+                    qa_pairs=[],
+                    assumptions=fairness_assumptions,
+                )
+
         if attempt_no == 1:
             initial_dsl_path = write_initial_dsl_artifact(run_dir=run_dir, candidate_source=candidate_source)
+            initial_explicit_fairness = _extract_action_fairness(candidate_source)
+            explicit_fairness_map = dict(initial_explicit_fairness)
+            previous_output = candidate_source
             for review_attempt_no in range(1, MAX_REVIEW_ATTEMPTS + 1):
                 review_prompt = build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=candidate_source)
                 review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
@@ -1074,6 +1247,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                             review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                             review_repair_path=str(review_repair_path) if review_repair_path else None,
                             assumptions_path=str(assumptions_path) if assumptions_path else None,
+                            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                             fix_comments=[],
                         )
                     )
@@ -1086,6 +1261,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                         summary=f"Review repair failed: {exc}",
                         validation_error=validation_error,
                         dsl_path=initial_dsl_path,
+                        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     )
                 if _review_has_questions(review_feedback) and not qa_pairs:
                     validation_error = "review repair response missing question/answer pairs for review questions"
@@ -1105,6 +1282,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                             review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                             review_repair_path=str(review_repair_path) if review_repair_path else None,
                             assumptions_path=str(assumptions_path) if assumptions_path else None,
+                            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                             fix_comments=[],
                         )
                     )
@@ -1117,17 +1296,26 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                         summary="Review repair failed: missing question answers",
                         validation_error=validation_error,
                         dsl_path=initial_dsl_path,
+                        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     )
+                explicit_fairness_map, inferred_fairness_map, fairness_assumptions = _update_fairness_provenance(
+                    initial_explicit_fairness=initial_explicit_fairness,
+                    previous_source=previous_output,
+                    candidate_source=candidate_source,
+                    inferred_fairness=inferred_fairness_map,
+                )
                 review_repair_path = write_review_repair_artifact(
                     run_dir=run_dir,
                     attempt_no=review_attempt_no,
                     candidate_source=candidate_source,
                 )
-                if qa_pairs:
+                if qa_pairs or fairness_assumptions:
                     assumptions_path = append_review_assumptions_artifact(
                         run_dir=run_dir,
-                        attempt_no=review_attempt_no,
+                        attempt_label=f"review attempt #{review_attempt_no}",
                         qa_pairs=qa_pairs,
+                        assumptions=fairness_assumptions,
                     )
                 previous_output = candidate_source
 
@@ -1157,6 +1345,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                     review_repair_path=str(review_repair_path) if review_repair_path else None,
                     assumptions_path=str(assumptions_path) if assumptions_path else None,
+                    explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                    inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                     fix_comments=fix_comments,
                 )
             )
@@ -1174,6 +1364,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                 review_repair_path=str(review_repair_path) if review_repair_path else None,
                 assumptions_path=str(assumptions_path) if assumptions_path else None,
+                explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+                inferred_fairness=_format_fairness_entries(inferred_fairness_map),
                 fix_comments=fix_comments,
             )
         )
@@ -1193,6 +1385,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             validation_error=validation_error or None,
             dsl_path=initial_dsl_path,
             warnings=warning_hints,
+            explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+            inferred_fairness=_format_fairness_entries(inferred_fairness_map),
         )
 
     return _finalize_validated_model(
@@ -1202,6 +1396,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         attempts=attempts,
         model=model,
         final_candidate_path=final_candidate_path,
+        explicit_fairness=_format_fairness_entries(explicit_fairness_map),
+        inferred_fairness=_format_fairness_entries(inferred_fairness_map),
         llm_client=client,
     )
 
@@ -1239,6 +1435,18 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
     underspecified = payload.get("underspecified_assumptions") or []
     if underspecified:
         lines.extend(f"- {item}" for item in underspecified)
+    else:
+        lines.append("- (none)")
+    lines.append("FAIRNESS_EXPLICIT:")
+    explicit_fairness = payload.get("explicit_fairness") or []
+    if explicit_fairness:
+        lines.extend(f"- {item}" for item in explicit_fairness)
+    else:
+        lines.append("- (none)")
+    lines.append("FAIRNESS_INFERRED:")
+    inferred_fairness = payload.get("inferred_fairness") or []
+    if inferred_fairness:
+        lines.extend(f"- {item}" for item in inferred_fairness)
     else:
         lines.append("- (none)")
     notes = payload.get("notes") or []
