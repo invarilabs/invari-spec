@@ -9,6 +9,7 @@ from invari_spec.pipeline.dsl_validation import (
 from invari_spec.pipeline.markdown_to_dsl import (
     build_dsl_fidelity_review_prompt,
     build_dsl_review_repair_prompt,
+    build_dsl_variant_prompt,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
     convert_markdown_to_tla,
@@ -24,6 +25,7 @@ from invari_spec.pipeline.result_types import (
     PipelineTiming,
     ReviewFinding,
     ReviewSummary,
+    VariantResult,
 )
 
 __all__ = [
@@ -35,8 +37,10 @@ __all__ = [
     "PipelineTiming",
     "ReviewFinding",
     "ReviewSummary",
+    "VariantResult",
     "build_dsl_fidelity_review_prompt",
     "build_dsl_review_repair_prompt",
+    "build_dsl_variant_prompt",
     "build_initial_markdown_to_dsl_prompt",
     "build_minimal_dsl_repair_prompt",
     "convert_markdown_to_tla",

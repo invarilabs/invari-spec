@@ -13,6 +13,7 @@ from invari_spec.pipeline import (
     MarkdownToTlaRequest,
     build_dsl_fidelity_review_prompt,
     build_dsl_review_repair_prompt,
+    build_dsl_variant_prompt,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
     convert_markdown_to_tla,
@@ -285,6 +286,27 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn('"required_change": "Change x."', prompt)
         self.assertIn("Binding assumption ledger", prompt)
 
+    def test_variant_prompt_carries_selected_assumptions(self) -> None:
+        prompt = build_dsl_variant_prompt(
+            markdown="# Spec\n",
+            previous_output='workflow("x")\ninit()\n',
+            assumption_ledger=[
+                AssumptionDecision(
+                    id="A1",
+                    finding_id="manual_review_gate",
+                    source_attempt=1,
+                    lens="state_exhaustiveness",
+                    evidence="Manual review is underspecified.",
+                    choices=["review before validation", "review after validation"],
+                    selected_choice="review before validation",
+                )
+            ],
+        )
+
+        self.assertIn("semantic DSL variant", prompt)
+        self.assertIn("review before validation", prompt)
+        self.assertIn('workflow("x")', prompt)
+
     def test_assumption_ledger_is_persisted_and_carried_to_next_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -326,6 +348,49 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertIn("manual review is separate from approval", client.prompts[3])
             self.assertEqual(len(result.review_summary.assumption_decisions if result.review_summary else []), 1)
             self.assertEqual(result.review_summary.assumption_ledger_path if result.review_summary else None, str(ledger_path))
+
+    def test_explore_mode_generates_capped_variant_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: ambiguous manual review\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    VALID_DSL,
+                    structured_review(
+                        severity="question",
+                        finding_id="manual_review_gate",
+                        choices=["review before validation", "review after validation"],
+                        selected_choice="review before validation",
+                    ),
+                    VALID_DSL,
+                    VALID_DSL,
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                    assumption_mode="explore",
+                    explore_variant_limit=2,
+                ),
+                llm_client=client,
+            )
+
+            report_path = root / "generated" / "invari_spec_check" / "SPEC" / "variants" / "variant_report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.variant_count if result.review_summary else None, 2)
+            self.assertEqual(result.review_summary.selected_variant_id if result.review_summary else None, "variant_1")
+            self.assertTrue(report_path.exists())
+            self.assertEqual(report["variant_count"], 2)
+            self.assertEqual(report["variants"][0]["status"], "pass")
+            self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "variants" / "variant_1" / "candidate.dsl.py").exists())
 
     def test_review_choice_selected_choice_can_extend_declared_choices(self) -> None:
         review = structured_review(

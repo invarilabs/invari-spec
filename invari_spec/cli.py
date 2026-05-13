@@ -33,10 +33,11 @@ def _add_pipeline_args(parser: argparse.ArgumentParser, *, file_required: bool) 
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument(
         "--assumption-mode",
-        choices=("default", "off"),
+        choices=("default", "explore", "off"),
         default="default",
         help="How review handles underspecified workflow choices.",
     )
+    parser.add_argument("--explore-variant-limit", type=int, default=4, help="Maximum variants to generate in explore mode.")
     tlc_group = parser.add_mutually_exclusive_group()
     tlc_group.add_argument("--run-tlc", dest="run_tlc", action="store_true", default=True)
     tlc_group.add_argument("--no-run-tlc", dest="run_tlc", action="store_false")
@@ -55,6 +56,7 @@ def _request_from_args(args: argparse.Namespace) -> MarkdownToTlaRequest:
         cwd=Path.cwd(),
         collect_timings=args.command == "benchmark",
         assumption_mode=args.assumption_mode,
+        explore_variant_limit=args.explore_variant_limit,
     )
 
 

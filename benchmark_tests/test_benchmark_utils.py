@@ -20,6 +20,7 @@ from invari_spec.pipeline import (
     MarkdownToTlaRequest,
     build_dsl_fidelity_review_prompt,
     build_dsl_review_repair_prompt,
+    build_dsl_variant_prompt,
     build_initial_markdown_to_dsl_prompt,
     build_minimal_dsl_repair_prompt,
     convert_markdown_to_tla,
@@ -104,6 +105,7 @@ class BenchmarkUtilsTest(unittest.TestCase):
             ),
             build_dsl_fidelity_review_prompt(markdown=markdown, dsl_source=VALID_DSL),
             build_dsl_review_repair_prompt(markdown=markdown, previous_output=VALID_DSL, review_feedback="1. Gap"),
+            build_dsl_variant_prompt(markdown=markdown, previous_output=VALID_DSL, assumption_ledger=[]),
             "Summarize these modeling assumptions in natural language for a developer reviewing the generated spec artifacts.",
         ]
 
@@ -114,6 +116,7 @@ class BenchmarkUtilsTest(unittest.TestCase):
                 "validation_repair",
                 "fidelity_review",
                 "fidelity_repair",
+                "variant_generation",
                 "assumptions_summary",
             ],
         )
@@ -287,6 +290,43 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertTrue(
                 (output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "assumption_ledger.json").exists()
             )
+
+    def test_explore_mode_attempts_capped_variants(self) -> None:
+        review_with_choices = structured_review(
+            severity="question",
+            finding_id="manual_review_gate",
+            choices=["manual review before validation", "manual review after validation"],
+            selected_choice="manual review before validation",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": review_with_choices,
+                    "variant_generation": [VALID_DSL, VALID_DSL],
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                    assumption_mode="explore",
+                    explore_variant_limit=2,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+            report_path = output_dir / "invari_spec_check" / "SPEC" / "variants" / "variant_report.json"
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(summary.llm_calls_by_kind["variant_generation"], 2)
+            self.assertEqual(result.review_summary.variant_count if result.review_summary else None, 2)
+            self.assertTrue(report_path.exists())
 
     def test_blocker_and_mixed_reviews_still_repair_only_for_blockers(self) -> None:
         mixed_review = json.dumps(

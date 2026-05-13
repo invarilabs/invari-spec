@@ -64,6 +64,19 @@ class AssumptionDecision:
 
 
 @dataclass(frozen=True)
+class VariantResult:
+    id: str
+    assumption_decisions: list[AssumptionDecision]
+    status: Literal["pass", "fail", "error"]
+    dsl_path: str | None = None
+    tla_path: str | None = None
+    cfg_path: str | None = None
+    tlc_output_path: str | None = None
+    validation_error: str | None = None
+    tlc_exit_code: int | None = None
+
+
+@dataclass(frozen=True)
 class ReviewSummary:
     outcome: Literal[
         "not_run",
@@ -83,6 +96,10 @@ class ReviewSummary:
     assumption_decisions: list[AssumptionDecision] = field(default_factory=list)
     assumption_ledger_path: str | None = None
     repairs_avoided_by_ledger: int = 0
+    variant_count: int = 0
+    selected_variant_id: str | None = None
+    variant_report_path: str | None = None
+    variants: list[VariantResult] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -97,7 +114,8 @@ class MarkdownToTlaRequest:
     run_tlc: bool = True
     cwd: Path = Path.cwd()
     collect_timings: bool = False
-    assumption_mode: Literal["off", "default"] = "default"
+    assumption_mode: Literal["off", "default", "explore"] = "default"
+    explore_variant_limit: int = 4
 
 
 @dataclass(frozen=True)

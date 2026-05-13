@@ -11,6 +11,7 @@ LLM_CALL_KINDS = (
     "validation_repair",
     "fidelity_review",
     "fidelity_repair",
+    "variant_generation",
     "assumptions_summary",
     "unknown",
 )
@@ -107,6 +108,8 @@ def compare_benchmark_summaries(
 
 
 def classify_llm_prompt(prompt: str) -> str:
+    if "You are generating one semantic DSL variant for an underspecified workflow." in prompt:
+        return "variant_generation"
     if "You are repairing a semantic DSL file based on formal modeling review feedback." in prompt:
         return "fidelity_repair"
     if "You are a formal modeling reviewer checking whether a generated semantic DSL file" in prompt:

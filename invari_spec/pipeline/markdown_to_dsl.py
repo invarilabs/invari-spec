@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+from itertools import product
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +32,7 @@ from invari_spec.pipeline.result_types import (
     PipelineTiming,
     ReviewFinding,
     ReviewSummary,
+    VariantResult,
 )
 from invari_spec.semantic_dsl import build_cfg, lower_to_tla, parse_dsl_source
 from invari_spec.semantic_dsl.errors import DslError
@@ -415,6 +417,39 @@ def build_dsl_review_repair_prompt(
     )
 
 
+def build_dsl_variant_prompt(
+    *,
+    markdown: str,
+    previous_output: str,
+    assumption_ledger: list[AssumptionDecision],
+    review_feedback: str | None = None,
+) -> str:
+    return (
+        "\n\n".join(
+            [
+                "You are generating one semantic DSL variant for an underspecified workflow.",
+                "Honor exactly the selected choices in the assumption ledger.",
+                "If formal review feedback is provided, address its severity=blocker findings in the variant.",
+                "Preserve unrelated behavior and do not invent extra product semantics.",
+                "Return only the full semantic DSL source, with no prose.",
+                "Original spec markdown:",
+                "```markdown",
+                markdown.strip(),
+                "```",
+                "Base DSL:",
+                "```python",
+                previous_output.strip(),
+                "```",
+                "Variant assumption ledger:",
+                _format_assumption_ledger(assumption_ledger),
+                "Formal review feedback to address:",
+                review_feedback.strip() if review_feedback else "(none)",
+            ]
+        ).strip()
+        + "\n"
+    )
+
+
 def build_assumptions_summary_prompt(*, assumptions_text: str) -> str:
     return (
         "\n\n".join(
@@ -683,7 +718,11 @@ def _build_review_summary(
     assumption_decisions: list[AssumptionDecision] | None = None,
     assumption_ledger_path: str | None = None,
     repairs_avoided_by_ledger: int = 0,
+    variant_results: list[VariantResult] | None = None,
+    variant_report_path: str | None = None,
 ) -> ReviewSummary:
+    variants = list(variant_results or [])
+    selected_variant = next((variant for variant in variants if variant.status == "pass"), None)
     return ReviewSummary(
         outcome=outcome,  # type: ignore[arg-type]
         review_rounds=review_rounds,
@@ -693,6 +732,10 @@ def _build_review_summary(
         assumption_decisions=list(assumption_decisions or []),
         assumption_ledger_path=assumption_ledger_path,
         repairs_avoided_by_ledger=repairs_avoided_by_ledger,
+        variant_count=len(variants),
+        selected_variant_id=selected_variant.id if selected_variant else None,
+        variant_report_path=variant_report_path,
+        variants=variants,
     )
 
 
@@ -723,6 +766,35 @@ def _assumption_decisions_from_findings(
             )
         )
     return decisions
+
+
+def _enumerate_assumption_variants(
+    *,
+    decisions: list[AssumptionDecision],
+    limit: int,
+) -> list[list[AssumptionDecision]]:
+    if limit < 1:
+        raise ValueError("explore_variant_limit must be at least 1")
+    choice_sets = [decision.choices or [decision.selected_choice] for decision in decisions]
+    variants: list[list[AssumptionDecision]] = []
+    for combination in product(*choice_sets):
+        variant_decisions = [
+            AssumptionDecision(
+                id=decision.id,
+                finding_id=decision.finding_id,
+                source_attempt=decision.source_attempt,
+                lens=decision.lens,
+                evidence=decision.evidence,
+                choices=decision.choices,
+                selected_choice=choice,
+                status=decision.status,
+            )
+            for decision, choice in zip(decisions, combination)
+        ]
+        variants.append(variant_decisions)
+        if len(variants) >= limit:
+            break
+    return variants
 
 
 def normalize_common_dsl_syntax(source: str) -> str:
@@ -846,6 +918,43 @@ def write_assumption_ledger_artifact(*, run_dir: Path, decisions: list[Assumptio
         encoding="utf-8",
     )
     return ledger_path
+
+
+def write_variant_dsl_artifact(*, run_dir: Path, variant_id: str, candidate_source: str) -> Path:
+    variant_dir = run_dir / "variants" / variant_id
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    variant_path = variant_dir / "candidate.dsl.py"
+    variant_path.write_text(candidate_source, encoding="utf-8")
+    return variant_path
+
+
+def write_variant_report_artifact(*, run_dir: Path, variants: list[VariantResult], truncated: bool) -> Path:
+    variants_dir = run_dir / "variants"
+    variants_dir.mkdir(parents=True, exist_ok=True)
+    report_path = variants_dir / "variant_report.json"
+    selected_variant = next((variant for variant in variants if variant.status == "pass"), None)
+    report_path.write_text(
+        json.dumps(
+            {
+                "mode": "explore",
+                "variant_count": len(variants),
+                "selected_variant_id": selected_variant.id if selected_variant else None,
+                "truncated": truncated,
+                "variants": [
+                    {
+                        **variant.__dict__,
+                        "assumption_decisions": [decision.__dict__ for decision in variant.assumption_decisions],
+                    }
+                    for variant in variants
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return report_path
 
 
 def write_review_parse_failure_artifact(*, run_dir: Path, attempt_no: int, raw_response: str, error: str) -> Path:
@@ -1278,6 +1387,90 @@ def _convert_existing_dsl(
     )
 
 
+def _generate_explore_variants(
+    *,
+    req: MarkdownToTlaRequest,
+    run_dir: Path,
+    markdown: str,
+    base_dsl_source: str,
+    decisions: list[AssumptionDecision],
+    review_feedback: str,
+    client: LLMClient,
+    timings: list[PipelineTiming] | None,
+) -> tuple[list[VariantResult], Path | None]:
+    if not decisions or req.assumption_mode != "explore":
+        return [], None
+    variant_ledgers = _enumerate_assumption_variants(
+        decisions=decisions,
+        limit=req.explore_variant_limit,
+    )
+    variants: list[VariantResult] = []
+    for index, variant_ledger in enumerate(variant_ledgers, start=1):
+        variant_id = f"variant_{index}"
+        variant_dir = run_dir / "variants" / variant_id
+        try:
+            prompt = build_dsl_variant_prompt(
+                markdown=markdown,
+                previous_output=base_dsl_source,
+                assumption_ledger=variant_ledger,
+                review_feedback=review_feedback,
+            )
+            with _timed_stage(timings, "variant_generation", variant_id):
+                candidate_source = normalize_llm_dsl_output(
+                    client.generate(prompt, model=req.llm_model, max_tokens=16384)
+                )
+            with _timed_stage(timings, "file_io", f"write {variant_id} DSL"):
+                dsl_path = write_variant_dsl_artifact(
+                    run_dir=run_dir,
+                    variant_id=variant_id,
+                    candidate_source=candidate_source,
+                )
+            with _timed_stage(timings, "dsl_validation", variant_id):
+                model = validate_dsl_source(candidate_source, str(dsl_path))
+            with _timed_stage(timings, "tla_lowering", variant_id):
+                tla_path, cfg_path = write_tla_artifacts(model, variant_dir)
+            status: Literal["pass", "fail", "error"] = "pass"
+            tlc_output_path: Path | None = None
+            tlc_exit_code: int | None = None
+            if req.run_tlc:
+                tlc_output_path = variant_dir / "tlc.out"
+                with _timed_stage(timings, "tlc", variant_id):
+                    tlc_status, tlc_exit_code, tlc_raw, _ = _run_tlc(tla_path, cfg_path, req.tla_jar_path)
+                tlc_output_path.write_text(tlc_raw, encoding="utf-8")
+                status = tlc_status
+            variants.append(
+                VariantResult(
+                    id=variant_id,
+                    assumption_decisions=variant_ledger,
+                    status=status,
+                    dsl_path=str(dsl_path),
+                    tla_path=str(tla_path),
+                    cfg_path=str(cfg_path),
+                    tlc_output_path=str(tlc_output_path) if tlc_output_path else None,
+                    tlc_exit_code=tlc_exit_code,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            variants.append(
+                VariantResult(
+                    id=variant_id,
+                    assumption_decisions=variant_ledger,
+                    status="error",
+                    validation_error=str(exc),
+                )
+            )
+    truncated = len(variant_ledgers) == req.explore_variant_limit and any(
+        len(decision.choices) > 1 for decision in decisions
+    )
+    with _timed_stage(timings, "file_io", "write variant report"):
+        report_path = write_variant_report_artifact(
+            run_dir=run_dir,
+            variants=variants,
+            truncated=truncated,
+        )
+    return variants, report_path
+
+
 def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient | None = None) -> MarkdownToTlaResult:
     pipeline_started_at = perf_counter() if req.collect_timings else None
     timings: list[PipelineTiming] | None = [] if req.collect_timings else None
@@ -1327,6 +1520,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     assumption_decisions: list[AssumptionDecision] = []
     assumption_ledger_path: Path | None = None
     repairs_avoided_by_ledger = 0
+    variant_results: list[VariantResult] = []
+    variant_report_path: Path | None = None
 
     def current_review_summary() -> ReviewSummary:
         return _build_review_summary(
@@ -1338,6 +1533,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             assumption_decisions=assumption_decisions,
             assumption_ledger_path=str(assumption_ledger_path) if assumption_ledger_path else None,
             repairs_avoided_by_ledger=repairs_avoided_by_ledger,
+            variant_results=variant_results,
+            variant_report_path=str(variant_report_path) if variant_report_path else None,
         )
 
     attempt_no = 0
@@ -1452,7 +1649,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
 
         for review_round_index in range(1, MAX_REVIEW_ATTEMPTS + 1):
             review_attempt_no += 1
-            active_ledger = assumption_decisions if req.assumption_mode == "default" else []
+            active_ledger = assumption_decisions if req.assumption_mode in {"default", "explore"} else []
             review_prompt = build_dsl_fidelity_review_prompt(
                 markdown=markdown,
                 dsl_source=candidate_source,
@@ -1493,7 +1690,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             blocker_findings = [finding for finding in findings if finding.severity == "blocker"]
             review_blocker_ids.extend(finding.id for finding in blocker_findings)
             review_assumption_count += sum(1 for finding in findings if finding.kind == "assumption")
-            if req.assumption_mode == "default":
+            if req.assumption_mode in {"default", "explore"}:
                 new_decisions = _assumption_decisions_from_findings(
                     findings=findings,
                     attempt_no=review_attempt_no,
@@ -1506,6 +1703,37 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                             run_dir=run_dir,
                             decisions=assumption_decisions,
                         )
+            if req.assumption_mode == "explore" and assumption_decisions:
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                variant_results, variant_report_path = _generate_explore_variants(
+                    req=req,
+                    run_dir=run_dir,
+                    markdown=markdown,
+                    base_dsl_source=candidate_source,
+                    decisions=assumption_decisions,
+                    review_feedback=review_feedback,
+                    client=client,
+                    timings=timings,
+                )
+                selected_variant = next((variant for variant in variant_results if variant.dsl_path), None)
+                if selected_variant and selected_variant.dsl_path:
+                    selected_path = Path(selected_variant.dsl_path)
+                    selected_source = selected_path.read_text(encoding="utf-8")
+                    try:
+                        model = validate_dsl_source(selected_source, str(selected_path))
+                        candidate_source = selected_source
+                        final_candidate_path = selected_path
+                        previous_output = selected_source
+                        warning_hints = list(model.warnings)
+                    except (DslError, ValueError):
+                        pass
+                review_outcome = "blockers_found" if blocker_findings else (
+                    "no_gaps_found" if verdict == "no_gaps_found" else "questions_or_suggestions_only"
+                )
+                break
             if not blocker_findings:
                 attempts[-1] = replace(
                     attempts[-1],
@@ -1516,13 +1744,24 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_notes.append(f"Fidelity review recorded {len(findings)} non-blocking finding(s); no repair was run.")
                 if active_ledger:
                     repairs_avoided_by_ledger += 1
+                if req.assumption_mode == "explore" and assumption_decisions:
+                    variant_results, variant_report_path = _generate_explore_variants(
+                        req=req,
+                        run_dir=run_dir,
+                        markdown=markdown,
+                        base_dsl_source=candidate_source,
+                        decisions=assumption_decisions,
+                        review_feedback=review_feedback,
+                        client=client,
+                        timings=timings,
+                    )
                 break
             review_outcome = "blockers_found"
             review_repair_prompt = build_dsl_review_repair_prompt(
                 markdown=markdown,
                 previous_output=candidate_source,
                 review_feedback=_review_repair_feedback_for_blockers(blocker_findings),
-                assumption_ledger=assumption_decisions if req.assumption_mode == "default" else [],
+                assumption_ledger=assumption_decisions if req.assumption_mode in {"default", "explore"} else [],
             )
             with _timed_stage(timings, "repair_loop", f"review repair {review_attempt_no}"):
                 raw_repair_response = client.generate(review_repair_prompt, model=req.llm_model, max_tokens=16384)
@@ -1743,6 +1982,9 @@ def render_result(result: MarkdownToTlaResult | dict, fmt: str) -> str:
                 f"ASSUMPTION_DECISIONS: {len(decisions)}",
                 f"ASSUMPTION_LEDGER: {review_summary.get('assumption_ledger_path') or ''}",
                 f"REPAIRS_AVOIDED_BY_LEDGER: {review_summary.get('repairs_avoided_by_ledger', 0)}",
+                f"VARIANT_COUNT: {review_summary.get('variant_count', 0)}",
+                f"SELECTED_VARIANT: {review_summary.get('selected_variant_id') or ''}",
+                f"VARIANT_REPORT: {review_summary.get('variant_report_path') or ''}",
             ]
         )
         for decision in decisions:
