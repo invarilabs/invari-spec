@@ -28,6 +28,7 @@ def _add_pipeline_args(parser: argparse.ArgumentParser, *, file_required: bool) 
     parser.add_argument("--dsl-file", help="Resume from an existing DSL attempt file.")
     parser.add_argument("--output-dir", default="generated", help="Directory for generated artifacts.")
     parser.add_argument("--model", help="Optional LLM model name.")
+    parser.add_argument("--review-model", help="Model used exclusively for fidelity review. Defaults to claude-opus-4-7 when --model is a Sonnet variant, otherwise claude-sonnet-4-6.")
     parser.add_argument("--prompt-path", help="Optional replacement prompt file.")
     parser.add_argument("--tla-jar-path", help="Path to tla2tools.jar.")
     parser.add_argument("--max-attempts", type=int, default=3)
@@ -57,6 +58,7 @@ def _request_from_args(args: argparse.Namespace) -> MarkdownToTlaRequest:
         collect_timings=args.command == "benchmark",
         assumption_mode=args.assumption_mode,
         explore_variant_limit=args.explore_variant_limit,
+        review_model=args.review_model,
     )
 
 

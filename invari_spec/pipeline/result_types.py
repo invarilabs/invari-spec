@@ -118,6 +118,7 @@ class MarkdownToTlaRequest:
     collect_timings: bool = False
     assumption_mode: Literal["off", "default", "explore"] = "default"
     explore_variant_limit: int = 4
+    review_model: str | None = None
 
 
 @dataclass(frozen=True)

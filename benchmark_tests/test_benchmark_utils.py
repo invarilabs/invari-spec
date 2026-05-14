@@ -615,3 +615,84 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertIn("LLM/timing counts:", proc.stdout)
             self.assertIn("fidelity review calls: 0", proc.stdout)
             self.assertIn("final DSL lines:", proc.stdout)
+
+
+class ReviewModelTest(unittest.TestCase):
+    def _run(self, req: MarkdownToTlaRequest) -> FakeBenchmarkLLMClient:
+        client = FakeBenchmarkLLMClient(
+            {
+                "initial_generation": VALID_DSL,
+                "fidelity_review": fenced_json(structured_review(severity="suggestion")),
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            from dataclasses import replace as dc_replace
+            convert_markdown_to_tla(
+                dc_replace(
+                    req,
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=Path(td) / "generated",
+                    run_tlc=False,
+                    cwd=ROOT,
+                ),
+                llm_client=client,
+            )
+        return client
+
+    def test_explicit_review_model_used_for_fidelity_review(self) -> None:
+        client = self._run(MarkdownToTlaRequest(
+            input_path=Path("."),
+            generated_root=Path("."),
+            llm_model="claude-sonnet-4-6",
+            review_model="claude-opus-4-7",
+        ))
+        for call in client.calls:
+            if call.classification == "fidelity_review":
+                self.assertEqual(call.model, "claude-opus-4-7")
+            else:
+                self.assertEqual(call.model, "claude-sonnet-4-6")
+
+    def test_sonnet_generation_defaults_to_opus_review(self) -> None:
+        client = self._run(MarkdownToTlaRequest(
+            input_path=Path("."),
+            generated_root=Path("."),
+            llm_model="claude-sonnet-4-6",
+        ))
+        review_calls = [c for c in client.calls if c.classification == "fidelity_review"]
+        self.assertTrue(review_calls)
+        for call in review_calls:
+            self.assertEqual(call.model, "claude-opus-4-7")
+
+    def test_opus_generation_defaults_to_sonnet_review(self) -> None:
+        client = self._run(MarkdownToTlaRequest(
+            input_path=Path("."),
+            generated_root=Path("."),
+            llm_model="claude-opus-4-7",
+        ))
+        review_calls = [c for c in client.calls if c.classification == "fidelity_review"]
+        self.assertTrue(review_calls)
+        for call in review_calls:
+            self.assertEqual(call.model, "claude-sonnet-4-6")
+
+    def test_none_generation_model_defaults_to_opus_review(self) -> None:
+        client = self._run(MarkdownToTlaRequest(
+            input_path=Path("."),
+            generated_root=Path("."),
+            llm_model=None,
+        ))
+        review_calls = [c for c in client.calls if c.classification == "fidelity_review"]
+        self.assertTrue(review_calls)
+        for call in review_calls:
+            self.assertEqual(call.model, "claude-opus-4-7")
+
+    def test_non_review_calls_use_generation_model(self) -> None:
+        client = self._run(MarkdownToTlaRequest(
+            input_path=Path("."),
+            generated_root=Path("."),
+            llm_model="claude-sonnet-4-6",
+            review_model="claude-opus-4-7",
+        ))
+        non_review_calls = [c for c in client.calls if c.classification != "fidelity_review"]
+        self.assertTrue(non_review_calls)
+        for call in non_review_calls:
+            self.assertEqual(call.model, "claude-sonnet-4-6")

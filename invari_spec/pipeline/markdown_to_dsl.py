@@ -241,6 +241,22 @@ def _find_tla_jar(explicit_path: Path | None = None) -> Path:
     )
 
 
+_SONNET_PREFIX = "claude-sonnet"
+_OPUS_PREFIX = "claude-opus"
+_DEFAULT_REVIEW_MODEL = "claude-opus-4-7"
+_DEFAULT_GENERATION_MODEL = "claude-sonnet-4-6"
+
+
+def _effective_review_model(req: MarkdownToTlaRequest) -> str | None:
+    if req.review_model is not None:
+        return req.review_model
+    if req.llm_model is None or _SONNET_PREFIX in req.llm_model:
+        return _DEFAULT_REVIEW_MODEL
+    if _OPUS_PREFIX in req.llm_model:
+        return _DEFAULT_GENERATION_MODEL
+    return _DEFAULT_REVIEW_MODEL
+
+
 def _extract_tlc_trace(raw: str) -> str:
     marker = "Error: The behavior up to this point is:"
     idx = raw.find(marker)
@@ -1662,7 +1678,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 assumption_ledger=active_ledger,
             )
             with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
-                review_feedback = client.generate(review_prompt, model=req.llm_model, max_tokens=4096).strip()
+                review_feedback = client.generate(review_prompt, model=_effective_review_model(req), max_tokens=4096).strip()
             with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
                 review_feedback_path = write_review_feedback_artifact(
                     run_dir=run_dir,
