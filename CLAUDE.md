@@ -4,7 +4,7 @@
 
 - **Run tests:** `.venv/bin/python -m unittest discover -s tests`
 - **Run pipeline:** `.venv/bin/invari-spec check --file <spec.md> [options]`
-- **TLA+ jar:** `/Users/kaungmyathtaywin/.vscode/extensions/tlaplus.vscode-ide-2026.5.81518/tools/tla2tools.jar` (from the VS Code TLA+ extension)
+- **TLA+ jar:** `/Users/kaungmyathtaywin/.vscode/extensions/tlaplus.vscode-ide-2026.5.121710/tools/tla2tools.jar` (from the VS Code TLA+ extension)
   - Pass via `--tla-jar-path` when running the pipeline with `--run-tlc`
 
 ## Commit conventions
