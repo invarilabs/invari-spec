@@ -51,6 +51,10 @@ DEFAULT_FIXTURE_ORDER = (
 MAX_REVIEW_ATTEMPTS = 3
 REVIEW_CAP_NOTE = f"Fidelity review stopped after reaching the cap of {MAX_REVIEW_ATTEMPTS} rounds."
 FIX_COMMENT_RE = re.compile(r"^\s*#\s*FIX attempt \d+:\s*.+$")
+INFERRED_FAIRNESS_RE = re.compile(
+    r"\binferred\b.*\b(?P<kind>weak|strong|wf|sf)\b.*\bfairness\b.*?(?:action\s+)?[`'\"](?P<action>[^`'\"]+)[`'\"]",
+    re.IGNORECASE,
+)
 
 DSL_CANONICAL_FORMS = """
 Canonical DSL forms:
@@ -58,7 +62,7 @@ Canonical DSL forms:
 - entity("entity_name", Record(field_name=Type, ...))
 - var("var_name", Type)
 - init(predicate1, predicate2, ...)
-- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
+- action("action_name", fairness="weak"|"strong"?, requires=[predicate, ...], changes=[update, ...], emits=[expr, ...], ensures=[predicate, ...])
 - invariant("name", predicate)
 - forbidden("name", when=predicate)
 - obligation("name", trigger=predicate, must_eventually=predicate)
@@ -121,6 +125,8 @@ def _build_validation_repair_hints(validation_error: str) -> list[str]:
         )
     if "obligation(" in error:
         hints.append('Expected form: obligation("name", trigger=<predicate>, must_eventually=<predicate>)')
+    if "fairness" in error:
+        hints.append('Expected action fairness form: action("name", fairness="weak"|"strong", requires=[...], changes=[...])')
     if "completion_requires(" in error:
         hints.extend(
             [
@@ -351,10 +357,12 @@ def build_dsl_fidelity_review_prompt(
         "\n\n".join(
             [
                 "You are a formal modeling reviewer checking whether a generated semantic DSL file faithfully captures a prose workflow spec.",
-                "Apply these lenses in order: (1) outcome correctness, (2) construct appropriateness, (3) invariant scoping, (4) state exhaustiveness, (5) terminal completeness, (6) entity/batch scope.",
+                "Apply these lenses in order: (1) outcome correctness, (2) construct appropriateness, (3) invariant scoping, (4) state exhaustiveness, (5) terminal completeness, (6) liveness fairness, (7) entity/batch scope.",
                 "Return only raw JSON or a fenced ```json block with this exact top-level shape:",
-                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required","choices":["viable interpretation A","viable interpretation B"],"selected_choice":"chosen conservative interpretation when this finding is an underspecified assumption"}]}',
+                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"outcome_correctness | construct_appropriateness | invariant_scoping | state_exhaustiveness | terminal_completeness | liveness_fairness | entity_batch_scope","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required","choices":["viable interpretation A","viable interpretation B"],"selected_choice":"chosen conservative interpretation when this finding is an underspecified assumption"}]}',
                 "Use severity=blocker only for source-backed fidelity gaps that require automatic DSL repair.",
+                "For lens=liveness_fairness, flag a blocker when an obligation depends on a system-owned action eventually running but the relevant action has no fairness=. The required_change should add fairness=\"weak\" for continuously enabled system work, or fairness=\"strong\" only for recurring intermittent enablement.",
+                "Do not require fairness for user choices, external services, or environment outcomes unless the markdown explicitly says that actor eventually acts.",
                 "Use severity=question for open product/modeling questions and severity=suggestion for non-blocking improvements.",
                 "When the source is underspecified, include choices for the viable interpretations and selected_choice for the conservative default. Treat that as an assumption finding unless source text proves the DSL wrong.",
                 "Honor the binding assumption ledger below. Do not reopen a ledger decision as a fresh blocker unless the markdown directly contradicts it; then use kind=assumption and severity=blocker with evidence for the contradiction.",
@@ -392,6 +400,8 @@ def build_dsl_review_repair_prompt(
                 "Apply only the listed severity=blocker findings while preserving unrelated structure.",
                 "Do not repair question-only or suggestion-only findings.",
                 "Do not add assumptions, states, fields, retry policies, actors, or terminal outcomes unless a blocker required_change explicitly requires them.",
+                "If a blocker requires inferred fairness, materialize it directly on the relevant action using fairness=\"weak\" or fairness=\"strong\".",
+                "Record every inferred fairness addition in the text block as an answered question, using wording like: Inferred weak fairness for action `action_name` because ...",
                 "Honor the binding assumption ledger. If a blocker can be repaired in more than one way, choose the ledger-selected interpretation.",
                 "Return exactly two fenced blocks and nothing else.",
                 "Begin your response with the ```python fenced block.",
@@ -608,6 +618,7 @@ ALLOWED_REVIEW_LENSES = {
     "invariant_scoping",
     "state_exhaustiveness",
     "terminal_completeness",
+    "liveness_fairness",
     "entity_batch_scope",
 }
 
@@ -1036,6 +1047,54 @@ def _latest_assumptions_path(attempts: list[DslGenerationAttempt]) -> Path | Non
     return None
 
 
+def _model_fairness_entries(model: WorkflowModel) -> list[str]:
+    return [f"{action.name}:{action.fairness}" for action in model.actions if action.fairness]
+
+
+def _normalize_fairness_kind(kind: str) -> str:
+    lowered = kind.lower()
+    if lowered == "wf":
+        return "weak"
+    if lowered == "sf":
+        return "strong"
+    return lowered
+
+
+def _inferred_fairness_from_text(text: str) -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for match in INFERRED_FAIRNESS_RE.finditer(text):
+        entry = f"{match.group('action')}:{_normalize_fairness_kind(match.group('kind'))}"
+        if entry not in seen:
+            seen.add(entry)
+            entries.append(entry)
+    return entries
+
+
+def _inferred_fairness_from_qa_pairs(qa_pairs: list[tuple[str, str]]) -> list[str]:
+    return _inferred_fairness_from_text("\n".join(f"{question}\n{answer}" for question, answer in qa_pairs))
+
+
+def _inferred_fairness_from_attempts(attempts: list[DslGenerationAttempt]) -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for attempt in attempts:
+        for entry in attempt.inferred_fairness:
+            if entry not in seen:
+                seen.add(entry)
+                entries.append(entry)
+        if not attempt.assumptions_path:
+            continue
+        assumptions_path = Path(attempt.assumptions_path)
+        if not assumptions_path.exists():
+            continue
+        for entry in _inferred_fairness_from_text(assumptions_path.read_text(encoding="utf-8")):
+            if entry not in seen:
+                seen.add(entry)
+                entries.append(entry)
+    return entries
+
+
 def _build_result(
     *,
     status: Literal["pass", "fail", "error"],
@@ -1055,11 +1114,16 @@ def _build_result(
     trace: str,
     has_liveness: bool,
     timings: list[PipelineTiming] | None,
+    has_fairness: bool = False,
+    explicit_fairness: list[str] | None = None,
+    inferred_fairness: list[str] | None = None,
     extra_notes: list[str] | None = None,
     review_summary: ReviewSummary | None = None,
 ) -> MarkdownToTlaResult:
     underspecified = _underspecified_assumptions(warnings)
-    fairness_sensitive = status == "fail" and has_liveness
+    explicit_fairness = list(explicit_fairness or [])
+    inferred_fairness = list(inferred_fairness or [])
+    fairness_sensitive = status == "fail" and has_liveness and not has_fairness
     if not has_liveness:
         liveness_classification: Literal["confirmed_failure", "missing_fairness", "not_applicable"] = "not_applicable"
     elif fairness_sensitive:
@@ -1094,6 +1158,8 @@ def _build_result(
         fairness_sensitive=fairness_sensitive,
         liveness_classification=liveness_classification,
         notes=notes,
+        explicit_fairness=explicit_fairness,
+        inferred_fairness=inferred_fairness,
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         timings=list(timings or []),
@@ -1123,6 +1189,9 @@ def _error_result(
     trace: str = "",
     warnings: list[str] | None = None,
     has_liveness: bool = False,
+    has_fairness: bool = False,
+    explicit_fairness: list[str] | None = None,
+    inferred_fairness: list[str] | None = None,
     timings: list[PipelineTiming] | None = None,
     pipeline_started_at: float | None = None,
     extra_notes: list[str] | None = None,
@@ -1152,6 +1221,9 @@ def _error_result(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        has_fairness=has_fairness,
+        explicit_fairness=explicit_fairness,
+        inferred_fairness=inferred_fairness,
         timings=recorded_timings,
         extra_notes=extra_notes,
         review_summary=review_summary,
@@ -1179,6 +1251,10 @@ def _finalize_validated_model(
     with _timed_stage(recorded_timings, "file_io", "write final DSL"):
         shutil.copyfile(final_candidate_path, final_dsl_path)
     has_liveness = bool(model.obligations)
+    model_fairness = _model_fairness_entries(model)
+    inferred_fairness = _inferred_fairness_from_attempts(attempts)
+    explicit_fairness = [entry for entry in model_fairness if entry not in set(inferred_fairness)]
+    has_fairness = bool(model_fairness)
     result_notes: list[str] = list(extra_notes or [])
 
     try:
@@ -1195,6 +1271,9 @@ def _finalize_validated_model(
             validation_error=str(exc),
             dsl_path=final_dsl_path,
             has_liveness=has_liveness,
+            has_fairness=has_fairness,
+            explicit_fairness=explicit_fairness,
+            inferred_fairness=inferred_fairness,
             timings=recorded_timings,
             pipeline_started_at=pipeline_started_at,
             extra_notes=result_notes,
@@ -1270,6 +1349,9 @@ def _finalize_validated_model(
                 tlc_output_path=tlc_output_path,
                 warnings=warnings,
                 has_liveness=has_liveness,
+                has_fairness=has_fairness,
+                explicit_fairness=explicit_fairness,
+                inferred_fairness=inferred_fairness,
                 timings=recorded_timings,
                 pipeline_started_at=pipeline_started_at,
                 extra_notes=result_notes,
@@ -1304,6 +1386,9 @@ def _finalize_validated_model(
         tlc_exit_code=tlc_exit_code,
         trace=trace,
         has_liveness=has_liveness,
+        has_fairness=has_fairness,
+        explicit_fairness=explicit_fairness,
+        inferred_fairness=inferred_fairness,
         timings=recorded_timings,
         extra_notes=result_notes,
         review_summary=review_summary,
@@ -1377,6 +1462,7 @@ def _convert_existing_dsl(
             candidate_path=str(candidate_path),
             validation_error_path=str(validation_path) if validation_path else None,
             validation_error=None,
+            explicit_fairness=_model_fairness_entries(model),
             fix_comments=fix_comments,
         )
     )
@@ -1646,6 +1732,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                 review_repair_path=str(review_repair_path) if review_repair_path else None,
                 assumptions_path=str(assumptions_path) if assumptions_path else None,
+                explicit_fairness=_model_fairness_entries(model),
                 fix_comments=fix_comments,
             )
         )
@@ -1903,7 +1990,17 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 model = None
                 final_candidate_path = None
                 break
+            inferred_fairness = list(
+                dict.fromkeys(
+                    [
+                        *_inferred_fairness_from_attempts(attempts),
+                        *_inferred_fairness_from_qa_pairs(qa_pairs),
+                    ]
+                )
+            )
             attempts.append(
+                # Fairness added by review repair is materialized in the DSL, but remains inferred provenance.
+                # Keep per-attempt explicit/inferred lists disjoint so result artifacts can distinguish source truth.
                 DslGenerationAttempt(
                     attempt=attempt_no,
                     status="valid",
@@ -1913,6 +2010,12 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                     review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
                     review_repair_path=str(review_repair_path) if review_repair_path else None,
                     assumptions_path=str(assumptions_path) if assumptions_path else None,
+                    explicit_fairness=[
+                        entry
+                        for entry in _model_fairness_entries(model)
+                        if entry not in set(inferred_fairness)
+                    ],
+                    inferred_fairness=inferred_fairness,
                     fix_comments=fix_comments,
                 )
             )

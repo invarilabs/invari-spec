@@ -16,6 +16,7 @@ init(
 
 action(
     "start_attempt",
+    fairness="weak",
     requires=[
         Eq(Field("task", "status"), "ready"),
     ],
@@ -26,6 +27,7 @@ action(
 
 action(
     "attempt_succeeds",
+    fairness="weak",
     requires=[
         Eq(Field("task", "status"), "attempting"),
         Field("task", "attempt_succeeds"),
@@ -37,6 +39,7 @@ action(
 
 action(
     "attempt_fails_can_retry",
+    fairness="weak",
     requires=[
         Eq(Field("task", "status"), "attempting"),
         Not(Field("task", "attempt_succeeds")),
@@ -50,6 +53,7 @@ action(
 
 action(
     "retry_attempt",
+    fairness="weak",
     requires=[
         Eq(Field("task", "status"), "failed"),
         Lt(Field("task", "retry_count"), Field("task", "max_retries")),
@@ -61,6 +65,7 @@ action(
 
 action(
     "attempt_fails_use_fallback",
+    fairness="weak",
     requires=[
         Eq(Field("task", "status"), "attempting"),
         Not(Field("task", "attempt_succeeds")),

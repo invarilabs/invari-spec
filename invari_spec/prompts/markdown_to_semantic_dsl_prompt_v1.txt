@@ -52,7 +52,7 @@ Required DSL function formats:
 - Collection(Type)
 - IntRange(lo, hi)
 - init(predicate1, predicate2, ...)
-- action("action_name", requires=[predicate, ...], changes=[update, ...], emits=["event_name", ...], ensures=[predicate, ...])
+- action("action_name", fairness="weak"|"strong"?, requires=[predicate, ...], changes=[update, ...], emits=["event_name", ...], ensures=[predicate, ...])
 - invariant("invariant_name", predicate)
 - forbidden("forbidden_name", when=predicate)
 - obligation("obligation_name", trigger=predicate, must_eventually=predicate)
@@ -97,6 +97,11 @@ Modeling rules:
 - Declare workflow state using entity(...) records or var(...).
 - Initialize every declared field and variable in init(...).
 - Convert workflow steps into action(...) declarations.
+- Use optional action-local fairness only for actions needed to make stated liveness obligations meaningful.
+- Use fairness="weak" when an internal system action should eventually run if it remains continuously enabled, such as scheduler progress, retry dispatch, timeout handling, fallback routing, or completion after prerequisites are met.
+- Use fairness="strong" only when the source text says an internal action must eventually run even if it is enabled intermittently, such as polling, recurring scans, or background reconciliation that may become disabled and re-enabled.
+- Do not add fairness to user choices, external service outcomes, approvals, payments, random failures, or other environment-controlled decisions; model those as nondeterministic branches without fairness.
+- Prefer no fairness when the property is safety-only or when liveness should fail because the workflow is missing a required action or branch.
 - Put current-state guards in requires=[...].
 - Put externally visible effects in emits=[...] only when a property needs to reason about that effect.
 - Use Emitted("event_name") or SeenEvent("event_name") only for events that appear in some action emits=[...].

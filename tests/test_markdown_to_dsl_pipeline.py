@@ -71,6 +71,42 @@ action(
 '''
 
 
+LIVENESS_DSL = '''
+workflow("fairness_reporting")
+
+entity("task", Record(
+    status=Enum("ready", "done"),
+))
+
+init(
+    Eq(Field("task", "status"), "ready"),
+)
+
+action(
+    "finish",
+    requires=[
+        Eq(Field("task", "status"), "ready"),
+    ],
+    changes=[
+        SetField("task", "status", "done"),
+    ],
+)
+
+obligation(
+    "task_eventually_finishes",
+    trigger=Eq(Field("task", "status"), "ready"),
+    must_eventually=Eq(Field("task", "status"), "done"),
+)
+'''
+
+
+FAIR_LIVENESS_DSL = LIVENESS_DSL.replace(
+    'action(\n    "finish",',
+    'action(\n    "finish",\n    fairness="weak",',
+    1,
+)
+
+
 INVALID_DSL = VALID_DSL.replace(
     "    # FIX attempt 2: initialized missing field task.retry_count\n    Eq(Field(\"task\", \"retry_count\"), 0),\n",
     "",
@@ -114,6 +150,7 @@ def structured_review(
     severity: str = "blocker",
     finding_id: str = "missing_retry_count_init",
     required_change: str = "Initialize task.retry_count.",
+    lens: str = "state_exhaustiveness",
     choices: list[str] | None = None,
     selected_choice: str | None = None,
 ) -> str:
@@ -121,7 +158,7 @@ def structured_review(
         "id": finding_id,
         "kind": "fidelity" if severity == "blocker" else "suggestion",
         "severity": severity,
-        "lens": "state_exhaustiveness",
+        "lens": lens,
         "evidence": "The markdown requires a complete task state.",
         "required_change": required_change if severity == "blocker" else "",
     }
@@ -243,6 +280,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
         self.assertIn('workflow("x")', prompt)
         self.assertIn('"verdict"', prompt)
         self.assertIn('"severity":"blocker | question | suggestion"', prompt)
+        self.assertIn("liveness_fairness", prompt)
         self.assertIn("Do not include prose outside the JSON", prompt)
         self.assertIn("Binding assumption ledger", prompt)
 
@@ -446,6 +484,17 @@ forbidden("cannot_retry_paid_order", when=when=And(
         _, findings = parse_structured_review_feedback(review)
 
         self.assertEqual(findings[0].kind, "fidelity")
+
+    def test_structured_review_accepts_liveness_fairness_lens(self) -> None:
+        review = structured_review(
+            finding_id="missing_finish_fairness",
+            required_change='Add fairness="weak" to action `finish`.',
+            lens="liveness_fairness",
+        )
+
+        _, findings = parse_structured_review_feedback(review)
+
+        self.assertEqual(findings[0].lens, "liveness_fairness")
 
     def test_review_loop_stops_when_no_gaps_found_is_in_longer_feedback(self) -> None:
         repaired = VALID_DSL.replace("# FIX attempt 2: initialized missing field task.retry_count\n", "")
@@ -837,6 +886,132 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertTrue(result.cfg_path and Path(result.cfg_path).exists())
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "initial.dsl.py").exists())
             self.assertIn("/dsl_validation_attempts/attempt_1.dsl.py", result.attempts[0].candidate_path or "")
+
+    def test_existing_dsl_file_reports_explicit_fairness(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: resume\n", encoding="utf-8")
+            dsl = root / "attempt_1.dsl.py"
+            dsl.write_text(FAIR_LIVENESS_DSL, encoding="utf-8")
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    dsl_file=dsl,
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=FakeLLMClient([""]),
+            )
+
+            self.assertEqual(result.explicit_fairness, ["finish:weak"])
+            self.assertEqual(result.inferred_fairness, [])
+            self.assertEqual(result.attempts[0].explicit_fairness, ["finish:weak"])
+            rendered = render_result(result, "text")
+            self.assertIn("FAIRNESS_EXPLICIT: finish:weak", rendered)
+
+    def test_review_repair_reports_inferred_fairness(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: fairness repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    LIVENESS_DSL,
+                    structured_review(
+                        finding_id="missing_finish_fairness",
+                        required_change='Add fairness="weak" to action `finish`.',
+                        lens="liveness_fairness",
+                    ),
+                    f"```python\n{FAIR_LIVENESS_DSL.lstrip()}```\n```text\nquestion#1: What fairness assumption is needed?\nanswer#1: Inferred weak fairness for action `finish` because the system should eventually finish once ready.\n```",
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.explicit_fairness, [])
+            self.assertEqual(result.inferred_fairness, ["finish:weak"])
+            self.assertEqual(result.attempts[1].explicit_fairness, [])
+            self.assertEqual(result.attempts[1].inferred_fairness, ["finish:weak"])
+            assumptions = Path(result.attempts[1].assumptions_path or "").read_text(encoding="utf-8")
+            self.assertIn("Inferred weak fairness for action `finish`", assumptions)
+
+    def test_later_review_repair_preserves_inferred_fairness_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: fairness repair\n", encoding="utf-8")
+            client = FakeLLMClient(
+                [
+                    LIVENESS_DSL,
+                    structured_review(
+                        finding_id="missing_finish_fairness",
+                        required_change='Add fairness="weak" to action `finish`.',
+                        lens="liveness_fairness",
+                    ),
+                    f"```python\n{FAIR_LIVENESS_DSL.lstrip()}```\n```text\nquestion#1: What fairness assumption is needed?\nanswer#1: Inferred weak fairness for action `finish` because the system should eventually finish once ready.\n```",
+                    structured_review(
+                        finding_id="keep_finish_fairness",
+                        required_change='Preserve fairness="weak" on action `finish`.',
+                        lens="liveness_fairness",
+                    ),
+                    f"```python\n{FAIR_LIVENESS_DSL.lstrip()}```\n```text\n```",
+                    "No gaps found.",
+                ]
+            )
+
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=skill,
+                    generated_root=root / "generated",
+                    max_attempts=1,
+                    run_tlc=False,
+                    cwd=root,
+                ),
+                llm_client=client,
+            )
+
+            self.assertEqual(result.explicit_fairness, [])
+            self.assertEqual(result.inferred_fairness, ["finish:weak"])
+            self.assertEqual(result.attempts[2].explicit_fairness, [])
+            self.assertEqual(result.attempts[2].inferred_fairness, ["finish:weak"])
+
+    def test_fairness_sensitive_classification_respects_explicit_fairness(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "SPEC.md"
+            skill.write_text("# Spec: resume\n", encoding="utf-8")
+            dsl = root / "attempt_1.dsl.py"
+            dsl.write_text(FAIR_LIVENESS_DSL, encoding="utf-8")
+
+            with patch("invari_spec.pipeline.markdown_to_dsl._run_tlc", return_value=("fail", 12, "TLC failed", "")):
+                result = convert_markdown_to_tla(
+                    MarkdownToTlaRequest(
+                        input_path=skill,
+                        generated_root=root / "generated",
+                        dsl_file=dsl,
+                        max_attempts=1,
+                        run_tlc=True,
+                        cwd=root,
+                    ),
+                    llm_client=FakeLLMClient([""]),
+                )
+
+            self.assertFalse(result.fairness_sensitive)
+            self.assertEqual(result.liveness_classification, "confirmed_failure")
 
     def test_existing_dsl_file_surfaces_tla_lowering_warnings(self) -> None:
         dsl_source = '''

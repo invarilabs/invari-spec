@@ -45,6 +45,7 @@ class ReviewFinding:
         "invariant_scoping",
         "state_exhaustiveness",
         "terminal_completeness",
+        "liveness_fairness",
         "entity_batch_scope",
     ]
     evidence: str
