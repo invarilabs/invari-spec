@@ -401,6 +401,95 @@ def build_dsl_fidelity_review_prompt(
     )
 
 
+_REVIEW_LENSES: tuple[str, ...] = (
+    "states",
+    "actions",
+    "invariants",
+    "terminal_completeness",
+    "obligations",
+)
+
+_LENS_QUESTIONS: dict[str, str] = {
+    "states": (
+        "Focus only on workflow states. "
+        "Are all states named in the spec present as enum values in the DSL? "
+        "Are there DSL enum states not mentioned in the spec?"
+    ),
+    "actions": (
+        "Focus only on actions and transitions. "
+        "Does each action described in the spec have a corresponding DSL action with matching preconditions and state effects? "
+        "Are there DSL actions with no corresponding spec action?"
+    ),
+    "invariants": (
+        "Focus only on rules, constraints, and safety properties. "
+        "Do all rules and constraints stated in the spec appear as DSL invariants or action guards? "
+        "Are there DSL invariants not grounded in the spec?"
+    ),
+    "terminal_completeness": (
+        "Focus only on terminal states and liveness completeness. "
+        "Are all terminal states from the spec reachable in the DSL? "
+        "Do terminal states have no outgoing transitions that would allow escape?"
+    ),
+    "obligations": (
+        "Focus only on liveness obligations. "
+        "Do all liveness requirements from the spec (must eventually, always eventually) appear as DSL obligations? "
+        "Are there DSL obligations not grounded in the spec?"
+    ),
+}
+
+
+def build_dsl_review_lens_prompt(
+    *,
+    lens: str,
+    markdown: str,
+    dsl_source: str,
+    assumption_ledger: list[AssumptionDecision] | None = None,
+) -> str:
+    ledger = list(assumption_ledger or [])
+    question = _LENS_QUESTIONS[lens]
+    return (
+        "\n\n".join(
+            [
+                f"You are a formal modeling reviewer checking whether a generated semantic DSL file faithfully captures a prose workflow spec. Lens: {lens}.",
+                question,
+                "Return only raw JSON or a fenced ```json block with this exact top-level shape:",
+                '{"verdict":"no_gaps_found | blockers_found | questions_or_suggestions_only","findings":[{"id":"stable_snake_case_id","kind":"fidelity | assumption | suggestion","severity":"blocker | question | suggestion","lens":"' + lens + '","evidence":"source-backed reason","required_change":"specific change, empty for question/suggestion when no automatic repair is required","choices":["viable interpretation A","viable interpretation B"],"selected_choice":"chosen conservative interpretation when this finding is an underspecified assumption"}]}',
+                "Use severity=blocker only for source-backed fidelity gaps that require automatic DSL repair.",
+                "Use severity=question for open product/modeling questions and severity=suggestion for non-blocking improvements.",
+                "When the source is underspecified, include choices and selected_choice. Treat that as an assumption finding unless source text proves the DSL wrong.",
+                "Honor the binding assumption ledger below. Do not reopen a ledger decision as a fresh blocker unless the markdown directly contradicts it.",
+                "If there are no gaps in this lens, use verdict=no_gaps_found and findings=[].",
+                "If there are only questions or suggestions, use verdict=questions_or_suggestions_only.",
+                "Do not include prose outside the JSON.",
+                "Binding assumption ledger:",
+                _format_assumption_ledger(ledger),
+                "Original spec markdown:",
+                "```markdown",
+                markdown.strip(),
+                "```",
+                "Generated semantic DSL:",
+                "```python",
+                dsl_source.strip(),
+                "```",
+            ]
+        ).strip()
+        + "\n"
+    )
+
+
+def _merge_lens_findings(
+    lens_results: list[tuple[str, list[ReviewFinding]]],
+) -> tuple[str, list[ReviewFinding]]:
+    all_findings: list[ReviewFinding] = []
+    for _lens, findings in lens_results:
+        all_findings.extend(findings)
+    if any(f.severity == "blocker" for f in all_findings):
+        return "blockers_found", all_findings
+    if all_findings:
+        return "questions_or_suggestions_only", all_findings
+    return "no_gaps_found", all_findings
+
+
 def build_dsl_review_repair_prompt(
     *,
     markdown: str,
@@ -912,6 +1001,28 @@ def write_review_repair_response_artifact(*, run_dir: Path, attempt_no: int, raw
     response_path = attempts_dir / f"attempt_{attempt_no}.repair_response.txt"
     response_path.write_text(raw_response, encoding="utf-8")
     return response_path
+
+
+def write_review_lens_artifact(
+    *, run_dir: Path, attempt_no: int, lens: str, verdict: str, findings: list[ReviewFinding]
+) -> Path:
+    attempts_dir = run_dir / "review_attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    lens_path = attempts_dir / f"attempt_{attempt_no}.lens_{lens}.json"
+    lens_path.write_text(
+        json.dumps(
+            {
+                "lens": lens,
+                "verdict": verdict,
+                "findings": [finding.__dict__ for finding in findings],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return lens_path
 
 
 def write_review_findings_artifact(*, run_dir: Path, attempt_no: int, verdict: str, findings: list[ReviewFinding]) -> Path:
@@ -1759,21 +1870,57 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
         for review_round_index in range(1, MAX_REVIEW_ATTEMPTS + 1):
             review_attempt_no += 1
             active_ledger = assumption_decisions if req.assumption_mode in {"default", "explore"} else []
-            review_prompt = build_dsl_fidelity_review_prompt(
-                markdown=markdown,
-                dsl_source=candidate_source,
-                assumption_ledger=active_ledger,
-            )
-            with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no}"):
-                review_feedback = client.generate(review_prompt, model=_effective_review_model(req), max_tokens=4096).strip()
+            lens_results: list[tuple[str, list[ReviewFinding]]] = []
+            review_feedback = ""
+            parse_failure_path = None
+            parse_failure_count = 0
+            for lens in _REVIEW_LENSES:
+                lens_prompt = build_dsl_review_lens_prompt(
+                    lens=lens,
+                    markdown=markdown,
+                    dsl_source=candidate_source,
+                    assumption_ledger=active_ledger,
+                )
+                with _timed_stage(timings, "fidelity_review", f"review {review_attempt_no} lens {lens}"):
+                    lens_raw = client.generate(lens_prompt, model=_effective_review_model(req), max_tokens=4096).strip()
+                review_feedback = review_feedback + lens_raw + "\n"
+                try:
+                    _lens_verdict, lens_findings = parse_structured_review_feedback(lens_raw)
+                except Exception:  # noqa: BLE001
+                    _lens_verdict, lens_findings = "no_gaps_found", []
+                    parse_failure_count += 1
+                with _timed_stage(timings, "file_io", f"write review lens {lens} {review_attempt_no}"):
+                    write_review_lens_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        lens=lens,
+                        verdict=_lens_verdict,
+                        findings=lens_findings,
+                    )
+                lens_results.append((lens, lens_findings))
             with _timed_stage(timings, "file_io", f"write review feedback {review_attempt_no}"):
                 review_feedback_path = write_review_feedback_artifact(
                     run_dir=run_dir,
                     attempt_no=review_attempt_no,
                     review_feedback=review_feedback or "No review feedback returned.",
                 )
+            if parse_failure_count == len(_REVIEW_LENSES):
+                with _timed_stage(timings, "file_io", f"write review parse failure {review_attempt_no}"):
+                    parse_failure_path = write_review_parse_failure_artifact(
+                        run_dir=run_dir,
+                        attempt_no=review_attempt_no,
+                        raw_response=review_feedback,
+                        error=f"All {len(_REVIEW_LENSES)} lens calls failed to return parseable JSON",
+                    )
+                attempts[-1] = replace(
+                    attempts[-1],
+                    review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                )
+                review_outcome = "review_parse_failed"
+                review_notes.append(f"Fidelity review parse failed: {parse_failure_path}")
+                break
             try:
-                verdict, findings = parse_structured_review_feedback(review_feedback)
+                verdict, findings = _merge_lens_findings(lens_results)
                 with _timed_stage(timings, "file_io", f"write review findings {review_attempt_no}"):
                     write_review_findings_artifact(
                         run_dir=run_dir,

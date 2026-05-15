@@ -42,6 +42,8 @@ class FakeLLMClient:
             self.prompts.append(prompt)
             if not self.outputs:
                 return ""
+            if len(self.outputs) == 1:
+                return self.outputs[0]
             return self.outputs.pop(0)
 
 
@@ -143,6 +145,9 @@ VALID_REPAIR_AFTER_INVALID_REVIEW = INVALID_REVIEW_REPAIR_DSL.replace(
     'init(\n    # FIX attempt 3: restore missing field task.retry_count after review repair\n    Eq(Field("task", "retry_count"), 0),\n',
     1,
 )
+
+
+NO_GAPS_JSON = '{"verdict":"no_gaps_found","findings":[]}'
 
 
 def structured_review(
@@ -359,6 +364,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                         choices=["manual review is separate from approval", "manual review counts as approval"],
                         selected_choice="manual review is separate from approval",
                     ),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{VALID_DSL}```\n```text\n```",
                     "No gaps found.",
                 ]
@@ -382,8 +388,8 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertTrue(ledger_path.exists())
             self.assertEqual(ledger_payload["decisions"][0]["finding_id"], "manual_review_gate")
             self.assertEqual(ledger_payload["decisions"][0]["selected_choice"], "manual review is separate from approval")
-            self.assertIn("manual review is separate from approval", client.prompts[2])
-            self.assertIn("manual review is separate from approval", client.prompts[3])
+            self.assertIn("manual review is separate from approval", client.prompts[6])
+            self.assertIn("manual review is separate from approval", client.prompts[7])
             self.assertEqual(len(result.review_summary.assumption_decisions if result.review_summary else []), 1)
             self.assertEqual(result.review_summary.assumption_ledger_path if result.review_summary else None, str(ledger_path))
 
@@ -506,6 +512,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     repaired,
                     structured_review(),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Initialize task.retry_count to 0.\n```",
                     "Review complete. No gaps found. Ready for validation.",
                 ]
@@ -524,10 +531,10 @@ forbidden("cannot_retry_paid_order", when=when=And(
 
             self.assertEqual(result.status, "pass")
             self.assertEqual(result.attempt_count, 2)
-            self.assertEqual(len(client.prompts), 4)
-            self.assertEqual(
-                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
-                "Review complete. No gaps found. Ready for validation.",
+            self.assertEqual(len(client.prompts), 12)
+            self.assertIn(
+                "No gaps found",
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8"),
             )
 
     def test_repair_success_writes_attempts_fix_comments_and_tla(self) -> None:
@@ -560,12 +567,12 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertEqual(result.warnings, [])
             self.assertFalse(result.fairness_sensitive)
             self.assertEqual(result.liveness_classification, "not_applicable")
-            self.assertEqual(len(client.prompts), 3)
+            self.assertEqual(len(client.prompts), 7)
             self.assertIsNone(result.attempts[0].review_feedback_path)
             self.assertTrue(result.attempts[1].review_feedback_path)
             self.assertTrue(Path(result.attempts[1].review_feedback_path or "").exists())
             self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
-            self.assertEqual(Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertIn("No gaps found", Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8"))
             self.assertIsNone(result.attempts[1].review_repair_path)
             self.assertIsNone(result.attempts[1].assumptions_path)
 
@@ -657,6 +664,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     repaired,
                     structured_review(),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                 ]
@@ -675,15 +683,15 @@ forbidden("cannot_retry_paid_order", when=when=And(
 
             self.assertEqual(result.status, "pass")
             self.assertEqual(result.attempt_count, 2)
-            self.assertEqual(len(client.prompts), 4)
+            self.assertEqual(len(client.prompts), 12)
             self.assertTrue(result.attempts[1].review_feedback_path)
             self.assertTrue(result.attempts[1].review_repair_path)
             self.assertTrue(result.attempts[1].assumptions_path)
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "initial.dsl.py").exists())
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_2.review.txt").exists())
-            self.assertEqual(
-                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8").strip(),
-                "No gaps found.",
+            self.assertIn(
+                "No gaps found",
+                Path(result.attempts[1].review_feedback_path or "").read_text(encoding="utf-8"),
             )
             self.assertEqual(
                 Path(result.attempts[1].review_repair_path or "").read_text(encoding="utf-8"),
@@ -707,6 +715,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     repaired,
                     structured_review(),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{repaired.lstrip()}```\n```text\n```",
                     "No gaps found.",
                 ]
@@ -736,6 +745,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     VALID_DSL,
                     structured_review(finding_id="add_reopened_status", required_change="Add reopened status."),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{INVALID_REVIEW_REPAIR_DSL.lstrip()}```\n```text\n```",
                     VALID_REPAIR_AFTER_INVALID_REVIEW,
                     "No gaps found.",
@@ -758,7 +768,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             self.assertEqual(result.attempt_count, 3)
             self.assertIn("add_reopened_status", (review_dir / "attempt_1.review.txt").read_text(encoding="utf-8"))
             self.assertTrue((review_dir / "attempt_1.dsl.py").exists())
-            self.assertEqual((review_dir / "attempt_2.review.txt").read_text(encoding="utf-8").strip(), "No gaps found.")
+            self.assertIn("No gaps found", (review_dir / "attempt_2.review.txt").read_text(encoding="utf-8"))
             self.assertFalse((review_dir / "attempt_2.dsl.py").exists())
             self.assertIn("/review_attempts/attempt_1.review.txt", result.attempts[1].review_feedback_path or "")
             self.assertIn("/review_attempts/attempt_2.review.txt", result.attempts[2].review_feedback_path or "")
@@ -818,7 +828,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
             )
 
             self.assertEqual(result.status, "pass")
-            self.assertEqual(len(client.prompts), 2)
+            self.assertEqual(len(client.prompts), 6)
             self.assertIsNone(result.attempts[0].review_repair_path)
             self.assertEqual(result.review_summary.outcome if result.review_summary else None, "review_parse_failed")
             self.assertTrue((root / "generated" / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_1.parse_failure.json").exists())
@@ -833,6 +843,7 @@ forbidden("cannot_retry_paid_order", when=when=And(
                 [
                     repaired,
                     structured_review(),
+                    NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON, NO_GAPS_JSON,
                     f"```python\n{repaired.lstrip()}```\n```text\nquestion#1: What should task.retry_count start at?\nanswer#1: Default task.retry_count to 0 because the spec never defines another initial value.\n```",
                     "No gaps found.",
                     "The model assumes task.retry_count starts at 0, which makes the finish path immediately well-defined.",

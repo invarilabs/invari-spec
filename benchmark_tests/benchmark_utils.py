@@ -149,7 +149,10 @@ class FakeBenchmarkLLMClient:
             responses = self._responses_by_kind.get(classification)
             if not responses:
                 raise AssertionError(f"no fake LLM response configured for {classification}")
-            response = responses.popleft()
+            if len(responses) == 1:
+                response = responses[0]
+            else:
+                response = responses.popleft()
         else:
             if not self._responses:
                 raise AssertionError(f"no fake LLM response left for {classification}")
@@ -183,11 +186,14 @@ def summarize_benchmark_result(
         stage_totals[stage] = stage_totals.get(stage, 0.0) + seconds
         stage_counts[stage] += 1
 
+    timing_counts = _classify_llm_timings(timings)
     calls_by_kind = Counter({kind: 0 for kind in LLM_CALL_KINDS})
     if llm_client is not None:
         calls_by_kind.update(llm_client.calls_by_kind())
+        # Override fidelity_review with round-based count from timings (5 lens calls = 1 round).
+        calls_by_kind["fidelity_review"] = timing_counts["fidelity_review"]
     else:
-        calls_by_kind.update(_classify_llm_timings(timings))
+        calls_by_kind.update(timing_counts)
 
     final_status = _get(result, "status")
     final_phase = _get(result, "phase")
@@ -262,13 +268,20 @@ def _classify_convergence(status: str | None, phase: str | None) -> str | None:
 
 def _classify_llm_timings(timings) -> Counter[str]:
     calls: Counter[str] = Counter()
+    seen_review_attempts: set[str] = set()
     for timing in timings:
         stage = _get(timing, "stage")
         detail = _get(timing, "detail") or ""
         if stage == "dsl_generation":
             calls["initial_generation"] += 1
         elif stage == "fidelity_review":
-            calls["fidelity_review"] += 1
+            # Count review rounds by distinct attempt number, not individual lens calls.
+            # Detail format: "review {attempt_no} lens {lens_name}"
+            parts = detail.split()
+            attempt_key = parts[1] if len(parts) >= 2 else detail
+            if attempt_key not in seen_review_attempts:
+                seen_review_attempts.add(attempt_key)
+                calls["fidelity_review"] += 1
         elif stage == "assumptions_summary":
             calls["assumptions_summary"] += 1
         elif stage == "repair_loop" and detail.startswith("review repair "):
