@@ -955,6 +955,12 @@ def _review_says_no_gaps(review_feedback: str) -> bool:
     return "no gaps found" in review_feedback.lower()
 
 
+def _normalize_blocker_key(finding: ReviewFinding) -> str:
+    def _slug(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return f"{finding.lens}:{_slug(finding.id)}:{_slug(finding.required_change)}"
+
+
 def write_initial_dsl_artifact(*, run_dir: Path, candidate_source: str) -> Path:
     initial_path = run_dir / "initial.dsl.py"
     initial_path.write_text(candidate_source, encoding="utf-8")
@@ -1736,6 +1742,7 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
     review_blocker_ids: list[str] = []
     review_assumption_count = 0
     review_notes: list[str] = []
+    previous_blocker_keys: frozenset[str] = frozenset()
     assumption_decisions: list[AssumptionDecision] = []
     assumption_ledger_path: Path | None = None
     repairs_avoided_by_ledger = 0
@@ -1946,6 +1953,32 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
             blocker_findings = [finding for finding in findings if finding.severity == "blocker"]
             review_blocker_ids.extend(finding.id for finding in blocker_findings)
             review_assumption_count += sum(1 for finding in findings if finding.kind == "assumption")
+            current_blocker_keys = frozenset(_normalize_blocker_key(f) for f in blocker_findings)
+            if blocker_findings and review_round_index > 1:
+                if current_blocker_keys == previous_blocker_keys:
+                    review_outcome = "repeated"
+                    review_notes.append(
+                        f"Review stopped early: same blocker set repeated after repair "
+                        f"({len(current_blocker_keys)} key(s): {sorted(current_blocker_keys)})."
+                    )
+                    attempts[-1] = replace(
+                        attempts[-1],
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                    )
+                    break
+                new_keys = current_blocker_keys - previous_blocker_keys
+                if new_keys and len(new_keys) > len(current_blocker_keys) / 2 and len(current_blocker_keys) >= len(previous_blocker_keys):
+                    review_outcome = "drifted"
+                    review_notes.append(
+                        f"Review stopped early: blocker set drifted "
+                        f"({len(new_keys)}/{len(current_blocker_keys)} keys are new)."
+                    )
+                    attempts[-1] = replace(
+                        attempts[-1],
+                        review_feedback_path=str(review_feedback_path) if review_feedback_path else None,
+                    )
+                    break
+            previous_blocker_keys = current_blocker_keys
             if req.assumption_mode in {"default", "explore"}:
                 new_decisions = _assumption_decisions_from_findings(
                     findings=findings,
@@ -2152,6 +2185,8 @@ def convert_markdown_to_tla(req: MarkdownToTlaRequest, *, llm_client: LLMClient 
                 warning_hints = []
                 model = None
                 final_candidate_path = None
+                if not review_capped:
+                    review_outcome = "validation_failed"
                 break
             inferred_fairness = list(
                 dict.fromkeys(

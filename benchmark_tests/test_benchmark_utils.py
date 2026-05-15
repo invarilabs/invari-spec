@@ -92,6 +92,21 @@ def fenced_json(payload: str) -> str:
     return f"```json\n{payload}\n```"
 
 
+def multi_blocker_review(*pairs: tuple[str, str]) -> str:
+    findings = [
+        {
+            "id": finding_id,
+            "kind": "fidelity",
+            "severity": "blocker",
+            "lens": "outcome_correctness",
+            "evidence": "The markdown contains a source-backed review finding.",
+            "required_change": required_change,
+        }
+        for finding_id, required_change in pairs
+    ]
+    return json.dumps({"verdict": "blockers_found", "findings": findings})
+
+
 class BenchmarkUtilsTest(unittest.TestCase):
     def test_fake_llm_classifies_benchmark_prompt_types(self) -> None:
         markdown = "# Spec\nA task retries until success.\n"
@@ -425,14 +440,26 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertEqual(findings_payload["findings"][0]["id"], "document_naming")
 
     def test_non_converging_fidelity_review_is_capped_at_three_rounds(self) -> None:
-        review_blocker = structured_review()
+        r1 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+            ("gap_gamma", "Add gamma state"),
+        )
+        r2 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+        )
+        r3 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_gamma", "Add gamma state"),
+        )
         repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td) / "generated"
             client = FakeBenchmarkLLMClient(
                 {
                     "initial_generation": VALID_DSL,
-                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_review": [r1] * 5 + [r2] * 5 + [r3] * 5,
                     "fidelity_repair": [repair_response, repair_response, repair_response],
                 }
             )
@@ -460,7 +487,19 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertFalse((output_dir / "invari_spec_check" / "SPEC" / "review_attempts" / "attempt_4.review.txt").exists())
 
     def test_capped_invalid_review_repair_reports_cap_note(self) -> None:
-        review_blocker = structured_review()
+        r1 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+            ("gap_gamma", "Add gamma state"),
+        )
+        r2 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+        )
+        r3 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_gamma", "Add gamma state"),
+        )
         valid_repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         invalid_repair_response = f"```python\n{INVALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
@@ -468,7 +507,7 @@ class BenchmarkUtilsTest(unittest.TestCase):
             client = FakeBenchmarkLLMClient(
                 {
                     "initial_generation": VALID_DSL,
-                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_review": [r1] * 5 + [r2] * 5 + [r3] * 5,
                     "fidelity_repair": [valid_repair_response, valid_repair_response, invalid_repair_response],
                 }
             )
@@ -493,14 +532,26 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
 
     def test_capped_tla_lowering_error_reports_cap_note(self) -> None:
-        review_blocker = structured_review()
+        r1 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+            ("gap_gamma", "Add gamma state"),
+        )
+        r2 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+        )
+        r3 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_gamma", "Add gamma state"),
+        )
         repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td) / "generated"
             client = FakeBenchmarkLLMClient(
                 {
                     "initial_generation": VALID_DSL,
-                    "fidelity_review": [review_blocker, review_blocker, review_blocker],
+                    "fidelity_review": [r1] * 5 + [r2] * 5 + [r3] * 5,
                     "fidelity_repair": [repair_response, repair_response, repair_response],
                 }
             )
@@ -519,6 +570,151 @@ class BenchmarkUtilsTest(unittest.TestCase):
             self.assertEqual(result.status, "error")
             self.assertEqual(result.phase, "tla_lowering")
             self.assertTrue(any("cap of 3 rounds" in note for note in result.notes))
+
+    def test_repeated_blocker_set_triggers_early_stop(self) -> None:
+        review_blocker = structured_review()
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": review_blocker,
+                    "fidelity_repair": repair_response,
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "repeated")
+            self.assertEqual(summary.fidelity_review_calls, 2)
+            self.assertEqual(summary.fidelity_repair_calls, 1)
+            self.assertTrue(any("repeated" in note for note in result.notes))
+
+    def test_normalized_blocker_identity_detects_repeated_across_casing(self) -> None:
+        review_round1 = structured_review(
+            finding_id="Missing State",
+            required_change="Add The Missing State Transition.",
+        )
+        review_round2 = structured_review(
+            finding_id="missing_state",
+            required_change="add the missing state transition",
+        )
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [review_round1] * 5 + [review_round2] * 5,
+                    "fidelity_repair": repair_response,
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "repeated")
+            self.assertEqual(summary.fidelity_review_calls, 2)
+            self.assertEqual(summary.fidelity_repair_calls, 1)
+
+    def test_drifting_blocker_set_triggers_early_stop(self) -> None:
+        r1 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+        )
+        r2 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_gamma", "Add gamma state"),
+            ("gap_delta", "Add delta state"),
+            ("gap_epsilon", "Add epsilon state"),
+        )
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [r1] * 5 + [r2] * 5,
+                    "fidelity_repair": repair_response,
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "drifted")
+            self.assertEqual(summary.fidelity_review_calls, 2)
+            self.assertEqual(summary.fidelity_repair_calls, 1)
+            self.assertTrue(any("drifted" in note for note in result.notes))
+
+    def test_shrinking_blocker_set_continues_until_converged(self) -> None:
+        r1 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+            ("gap_beta", "Add beta state"),
+        )
+        r2 = multi_blocker_review(
+            ("gap_alpha", "Add alpha state"),
+        )
+        no_gaps = "No gaps found."
+        repair_response = f"```python\n{VALID_DSL}```\n```text\n```"
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "generated"
+            client = FakeBenchmarkLLMClient(
+                {
+                    "initial_generation": VALID_DSL,
+                    "fidelity_review": [r1] * 5 + [r2] * 5 + [no_gaps],
+                    "fidelity_repair": [repair_response, repair_response],
+                }
+            )
+            result = convert_markdown_to_tla(
+                MarkdownToTlaRequest(
+                    input_path=ROOT / "examples" / "workflow_retry_with_fallback" / "SPEC.md",
+                    generated_root=output_dir,
+                    run_tlc=False,
+                    cwd=ROOT,
+                    collect_timings=True,
+                ),
+                llm_client=client,
+            )
+
+            summary = summarize_benchmark_result(result, llm_client=client)
+
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.review_summary.outcome if result.review_summary else None, "no_gaps_found")
+            self.assertEqual(summary.fidelity_review_calls, 3)
+            self.assertEqual(summary.fidelity_repair_calls, 2)
 
     def test_compare_benchmark_summaries_reports_before_after_deltas(self) -> None:
         before = BenchmarkResultSummary(
